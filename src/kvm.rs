@@ -9,8 +9,8 @@ use std::{
 };
 
 use libc::{
-    close, ioctl, mmap, MAP_ANON, MAP_FAILED, MAP_SHARED, O_RDWR, PROT_READ, PROT_WRITE, _IOR,
-    _IOW, _IOWR,
+    __u64, close, ioctl, mmap, MAP_ANON, MAP_FAILED, MAP_SHARED, O_RDWR, PROT_READ, PROT_WRITE,
+    _IO, _IOR, _IOW, _IOWR,
 };
 
 const KVMIO: u32 = 0xae;
@@ -25,10 +25,34 @@ const KVM_SET_CPUID2: libc::c_ulong = 0x4008ae90;
 const KVM_GET_SREGS: libc::c_ulong = _IOR::<kvm_sregs>(KVMIO, 0x83);
 const KVM_SET_SREGS: libc::c_ulong = _IOW::<kvm_sregs>(KVMIO, 0x84);
 
-const KVM_GET_REGS: libc::c_ulong = _IOR::<kvm_sregs>(KVMIO, 0x81);
-const KVM_SET_REGS: libc::c_ulong = _IOR::<kvm_sregs>(KVMIO, 0x82);
+const KVM_GET_REGS: libc::c_ulong = _IOR::<kvm_regs>(KVMIO, 0x81);
+const KVM_SET_REGS: libc::c_ulong = _IOW::<kvm_regs>(KVMIO, 0x82);
+const KVM_RUN: libc::c_ulong = _IO(KVMIO, 0x80);
 
 const KVM_MAX_CPUID_ENTRIES: usize = 100;
+
+#[repr(C)]
+#[derive(Default)]
+pub struct kvm_regs {
+    pub rax: __u64,
+    pub rbx: __u64,
+    pub rcx: __u64,
+    pub rdx: __u64,
+    pub rsi: __u64,
+    pub rdi: __u64,
+    pub rsp: __u64,
+    pub rbp: __u64,
+    pub r8: __u64,
+    pub r9: __u64,
+    pub r10: __u64,
+    pub r11: __u64,
+    pub r12: __u64,
+    pub r13: __u64,
+    pub r14: __u64,
+    pub r15: __u64,
+    pub rip: __u64,
+    pub rflags: __u64,
+}
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Default)]
@@ -50,7 +74,7 @@ pub struct kvm_segment {
 const fn seg_with_st(selector_index: u16, type_: u8) -> kvm_segment {
     kvm_segment {
         base: 0,
-        limit: 0x000fffff,
+        limit: 0xfffffff,
         selector: selector_index << 3,
         // 0b1011: Code, Executed/Read, accessed
         // 0b0011: Data, Read/Write, accessed
@@ -166,6 +190,7 @@ struct kvm_userspace_memory_region {
     pub userspace_addr: u64,  // userspace_addr
 }
 #[repr(C)]
+#[derive(Debug)]
 struct kvm_run {
     pub request_interrupt_window: u8,
     pub immediate_exit: u8,
@@ -244,7 +269,7 @@ impl VCpu {
 
         let mut sregs = kvm_sregs::default();
         // Get the current sregs first to avoid wiping other important deafaults
-        let ret = unsafe { ioctl(self.fd, KVM_GET_REGS, &mut sregs, 0) };
+        let ret = unsafe { ioctl(self.fd, KVM_GET_SREGS, &mut sregs, 0) };
         if ret < 0 {
             return Err(io::Error::last_os_error()).context("failed to get current sregs");
         }
@@ -263,7 +288,6 @@ impl VCpu {
         sregs.ss = DATA_SEG;
 
         // Now we need to setup the base GDT table and load it to memory
-
         // construct gdt table, write to memory and set it to register
         let gdt_table: [u64; 3] = [
             0,                       // NULL
@@ -287,20 +311,53 @@ impl VCpu {
 
         // PAE enabling
         sregs.cr4 = 1 << 5;
+        sregs.cr4 |= 0x600;
 
         // Enable long mode in efer
-        sregs.efer |= 1 << 8; // Long Mode enable
-        sregs.efer |= 1 << 10; // Long mode Active
+        sregs.efer = 0x500; // Long Mode enable and active
 
         // Setup page table
         sregs.cr3 = 0x2000;
-
+        sregs.cr0 = 0x80050033;
         let ret = unsafe { ioctl(self.fd, KVM_SET_SREGS, &sregs, 0) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error()).context("failed to set current sregs");
+        }
+
+        Ok(())
+    }
+
+    fn init_registers(&self, rip: __u64, rsi: __u64) -> Result<()> {
+        let mut regs = kvm_regs::default();
+
+        let ret = unsafe { ioctl(self.fd, KVM_GET_REGS, &mut regs, 0) };
         if ret < 0 {
             return Err(io::Error::last_os_error()).context("failed to get current sregs");
         }
 
+        regs.rflags = 2;
+        regs.rip = rip;
+        regs.rsi = rsi;
+
+        let ret = unsafe { ioctl(self.fd, KVM_SET_REGS, &mut regs, 0) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error())
+                .context("failed to get supported cpuid features");
+        }
+
         Ok(())
+    }
+
+    fn run(&self) -> Result<()> {
+        loop {
+            let ret = unsafe { ioctl(self.fd, KVM_RUN, 0) };
+            if ret < 0 {
+                return Err(io::Error::last_os_error())
+                    .context("failed to get supported cpuid features");
+            }
+            let kvm_run = unsafe { self.run_ptr.as_ref() };
+            println!("KVM EXIT {:?}\n", kvm_run);
+        }
     }
 }
 
@@ -454,6 +511,26 @@ impl VM {
                 )
             };
             cpu.enter_long_mode(mem)?;
+        }
+        Ok(())
+    }
+
+    pub fn load_code(&self, code: &Vec<u8>) -> Result<()> {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                code.as_ptr(),
+                self.memory_regions.userspace_addr as *mut _,
+                code.len(),
+            );
+        };
+        Ok(())
+    }
+
+    pub fn run(&mut self) -> Result<()> {
+        // actually we only have one cpu
+        for vcpu in &self.vcpus_fd {
+            vcpu.init_registers(0, 0)?;
+            vcpu.run()?;
         }
         Ok(())
     }
