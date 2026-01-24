@@ -4,15 +4,19 @@ use std::{
     arch::x86_64::CpuidResult,
     error::Error,
     ffi::{c_int, c_void, CString},
+    intrinsics::copy_nonoverlapping,
     io::{self, Write},
     mem::MaybeUninit,
     ptr::NonNull,
 };
+use xmas_elf::{header::Type, symbol_table::Visibility, ElfFile};
 
 use libc::{
     __u64, close, dirent, ioctl, mmap, MAP_ANON, MAP_FAILED, MAP_SHARED, O_RDWR, PROT_READ,
     PROT_WRITE, _IO, _IOR, _IOW, _IOWR,
 };
+
+use crate::bootparams::{__u8, boot_params, CAN_USE_HEAP, KEEP_SEGMENTS};
 
 const KVMIO: u32 = 0xae;
 const KVM_GET_API_VERSION: libc::c_ulong = 0xae00;
@@ -38,6 +42,9 @@ const KVM_EXIT_HLT: u32 = 5;
 
 // IO direction
 // To lazy to retype everything, just import from kvm_bindings
+const ADDR_BOOT_PARAMS: __u64 = 0x10000;
+const ADDR_CMDLINE: usize = 0x20000;
+const CMDLINE: &[u8] = b"console=ttyS0 earlyprintk=ttyS0";
 
 #[repr(C)]
 #[derive(Default)]
@@ -370,6 +377,7 @@ impl VCpu {
             let kvm_run = unsafe { self.run_ptr.as_ref() };
 
             /*
+            * DEBUG
             let mut regs = kvm_regs::default();
             let ret = unsafe { ioctl(self.fd, KVM_GET_REGS, &mut regs, 0) };
             if ret < 0 {
@@ -381,6 +389,7 @@ impl VCpu {
             if ret < 0 {
                 return Err(io::Error::last_os_error()).context("failed to get current sregs");
             }
+            println!("{:?} rip: {}", kvm_run, regs.rip);
             */
             match kvm_run.exit_reason {
                 KVM_EXIT_IO => {
@@ -559,21 +568,112 @@ impl VM {
         Ok(())
     }
 
-    pub fn load_code(&self, code: &Vec<u8>) -> Result<()> {
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                code.as_ptr(),
-                (self.memory_regions.userspace_addr as *mut u8).add(0x100000),
-                code.len(),
-            );
-        };
-        Ok(())
+    fn setup_boot_params(boot_params: &mut boot_params, cmdline_addr: u32, total_mem_bytes: u64) {
+        // Constants for E820 types
+        const E820_RAM: u32 = 1;
+        const E820_RESERVED: u32 = 2;
+        // 1. Setup Header (hdr)
+        // 0xFF means "Unregistered/Custom Bootloader". Without this, Linux won't boot.
+        boot_params.hdr.type_of_loader = 0xFF;
+        boot_params.hdr.ext_loader_type = 0;
+        // VGA display
+        boot_params.hdr.vid_mode = 0xFFFF;
+
+        // 2. Command Line setup
+        // Point to where you loaded the "console=ttyS0..." string in guest memory
+        boot_params.hdr.cmd_line_ptr = cmdline_addr;
+        boot_params.ext_cmd_line_ptr = 0;
+        boot_params.hdr.cmdline_size = CMDLINE.len() as u32;
+
+        // No ramdisk now
+        boot_params.hdr.ramdisk_size = 0;
+        boot_params.hdr.ramdisk_image = 0;
+
+        boot_params.hdr.loadflags = (CAN_USE_HEAP as __u8) | 0x01 | (KEEP_SEGMENTS as __u8);
+        boot_params.hdr.heap_end_ptr = 0xFE00;
+        boot_params.hdr.ext_loader_ver = 0x0;
+
+        const KERNEL_TYPE_OF_LOADER: u8 = 0xff;
+        const KERNEL_BOOT_FLAG_MAGIC_NUMBER: u16 = 0xaa55;
+        const KERNEL_HDR_MAGIC_NUMBER: u32 = 0x5372_6448;
+        const KERNEL_MIN_ALIGNMENT_BYTES: u32 = 0x0100_0000;
+
+        boot_params.hdr.type_of_loader = KERNEL_TYPE_OF_LOADER;
+        boot_params.hdr.boot_flag = KERNEL_BOOT_FLAG_MAGIC_NUMBER;
+        boot_params.hdr.header = KERNEL_HDR_MAGIC_NUMBER;
+        boot_params.hdr.kernel_alignment = KERNEL_MIN_ALIGNMENT_BYTES;
+
+        // 3. E820 Memory Map
+        // We define 2 regions: Low memory and High memory
+        boot_params.e820_entries = 2;
+
+        // Entry 0: Low Memory (0 to ~640KB)
+        boot_params.e820_table[0].addr = 0x0;
+        boot_params.e820_table[0].size = 0x9FC00;
+        boot_params.e820_table[0].type_ = E820_RAM;
+
+        // Entry 1: High Memory (1MB up to max memory)
+        boot_params.e820_table[1].addr = 0x100000;
+        boot_params.e820_table[1].size = total_mem_bytes - 0x100000;
+        boot_params.e820_table[1].type_ = E820_RAM;
     }
 
-    pub fn run(&mut self) -> Result<()> {
+    pub fn load_code(&self, vmlinux: &Vec<u8>) -> Result<__u64> {
+        let elf = ElfFile::new(vmlinux).map_err(|e| anyhow::anyhow!(e))?;
+        let mut boot_params = boot_params::default();
+        unsafe {
+            std::ptr::copy_nonoverlapping(vmlinux.as_ptr().cast(), &mut boot_params, 1);
+        }
+
+        Self::setup_boot_params(
+            &mut boot_params,
+            ADDR_CMDLINE as u32,
+            self.memory_regions.memory_size,
+        );
+
+        for ph in elf.program_iter() {
+            if ph.get_type().unwrap_or(xmas_elf::program::Type::Null)
+                == xmas_elf::program::Type::Load
+            {
+                let offset = ph.offset() as usize;
+                let file_size = ph.file_size() as usize;
+                let mem_size = ph.mem_size() as usize;
+                let paddr = ph.physical_addr() as usize; // GPA
+
+                // Copy data from the ELF into guest memory
+                unsafe {
+                    let dest = self.memory_regions.userspace_addr as *mut u8;
+                    let src = vmlinux[offset..(offset + file_size)].as_ptr();
+
+                    std::ptr::copy_nonoverlapping(src, dest.add(paddr), file_size);
+
+                    // Padding zero (to BSS) if mem_size > file_size
+                    if mem_size > file_size {
+                        std::ptr::write_bytes(dest.add(paddr + file_size), 0, mem_size - file_size);
+                    }
+                };
+            }
+        }
+        unsafe {
+            let src: *const boot_params = &boot_params as *const boot_params;
+            std::ptr::copy_nonoverlapping(
+                src as *const u8,
+                (self.memory_regions.userspace_addr as *mut u8).add(0x10000),
+                size_of_val(&boot_params),
+            );
+            std::ptr::copy_nonoverlapping(
+                CMDLINE.as_ptr(),
+                (self.memory_regions.userspace_addr as *mut u8).add(ADDR_CMDLINE),
+                CMDLINE.len(),
+            );
+        }
+        Ok(elf.header.pt2.entry_point())
+    }
+
+    pub fn run(&mut self, entry: __u64) -> Result<()> {
         // actually we only have one cpu
         for vcpu in &self.vcpus_fd {
-            vcpu.init_registers(0x100000, 0)?;
+            vcpu.init_registers(entry, ADDR_BOOT_PARAMS as __u64)?;
             vcpu.run()?;
         }
         Ok(())
