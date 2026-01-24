@@ -1,16 +1,17 @@
 use anyhow::{anyhow, Context, Result};
+use kvm_bindings::{kvm_run__bindgen_ty_1, kvm_run__bindgen_ty_2, KVM_EXIT_IO_OUT};
 use std::{
     arch::x86_64::CpuidResult,
     error::Error,
     ffi::{c_int, c_void, CString},
-    io,
+    io::{self, Write},
     mem::MaybeUninit,
     ptr::NonNull,
 };
 
 use libc::{
-    __u64, close, ioctl, mmap, MAP_ANON, MAP_FAILED, MAP_SHARED, O_RDWR, PROT_READ, PROT_WRITE,
-    _IO, _IOR, _IOW, _IOWR,
+    __u64, close, dirent, ioctl, mmap, MAP_ANON, MAP_FAILED, MAP_SHARED, O_RDWR, PROT_READ,
+    PROT_WRITE, _IO, _IOR, _IOW, _IOWR,
 };
 
 const KVMIO: u32 = 0xae;
@@ -30,6 +31,13 @@ const KVM_SET_REGS: libc::c_ulong = _IOW::<kvm_regs>(KVMIO, 0x82);
 const KVM_RUN: libc::c_ulong = _IO(KVMIO, 0x80);
 
 const KVM_MAX_CPUID_ENTRIES: usize = 100;
+
+// Exit reason
+const KVM_EXIT_IO: u32 = 2;
+const KVM_EXIT_HLT: u32 = 5;
+
+// IO direction
+// To lazy to retype everything, just import from kvm_bindings
 
 #[repr(C)]
 #[derive(Default)]
@@ -201,6 +209,10 @@ struct kvm_run {
     pub flags: u16,
     pub cr8: u64,
     pub apic_base: u64,
+    pub __bindgen_anon_1: kvm_run__bindgen_ty_1,
+    pub kvm_valid_regs: __u64,
+    pub kvm_dirty_regs: __u64,
+    pub s: kvm_run__bindgen_ty_2,
 }
 
 struct Kvm {
@@ -356,7 +368,39 @@ impl VCpu {
                     .context("failed to get supported cpuid features");
             }
             let kvm_run = unsafe { self.run_ptr.as_ref() };
-            println!("KVM EXIT {:?}\n", kvm_run);
+
+            /*
+            let mut regs = kvm_regs::default();
+            let ret = unsafe { ioctl(self.fd, KVM_GET_REGS, &mut regs, 0) };
+            if ret < 0 {
+                return Err(io::Error::last_os_error()).context("failed to get current sregs");
+            }
+            let mut sregs = kvm_sregs::default();
+            // Get the current sregs first to avoid wiping other important deafaults
+            let ret = unsafe { ioctl(self.fd, KVM_GET_SREGS, &mut sregs, 0) };
+            if ret < 0 {
+                return Err(io::Error::last_os_error()).context("failed to get current sregs");
+            }
+            */
+            match kvm_run.exit_reason {
+                KVM_EXIT_IO => {
+                    let io = unsafe { kvm_run.__bindgen_anon_1.io };
+                    let port = io.port;
+                    let dir = io.direction as u32;
+                    if dir == KVM_EXIT_IO_OUT && port == 0x3f8u16 {
+                        let offset = unsafe { kvm_run.__bindgen_anon_1.io.data_offset } as usize;
+                        let character =
+                            unsafe { *((self.run_ptr.as_ptr() as *mut u8).add(offset)) } as char;
+                        print!("{}", character);
+                        _ = std::io::stdout().flush();
+                    }
+                }
+                KVM_EXIT_HLT => {
+                    println!("Guest executed HLT. Stopping.");
+                    break Ok(());
+                }
+                _ => {}
+            };
         }
     }
 }
@@ -519,7 +563,7 @@ impl VM {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 code.as_ptr(),
-                self.memory_regions.userspace_addr as *mut _,
+                (self.memory_regions.userspace_addr as *mut u8).add(0x100000),
                 code.len(),
             );
         };
@@ -529,7 +573,7 @@ impl VM {
     pub fn run(&mut self) -> Result<()> {
         // actually we only have one cpu
         for vcpu in &self.vcpus_fd {
-            vcpu.init_registers(0, 0)?;
+            vcpu.init_registers(0x100000, 0)?;
             vcpu.run()?;
         }
         Ok(())
