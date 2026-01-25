@@ -1,18 +1,16 @@
 use anyhow::{anyhow, Context, Result};
-use kvm_bindings::{
-    kvm_cpuid2, kvm_cpuid_entry2, kvm_run__bindgen_ty_1, kvm_run__bindgen_ty_2, KVM_EXIT_IO_OUT,
-};
+use kvm_bindings::{kvm_cpuid2, kvm_run__bindgen_ty_1, kvm_run__bindgen_ty_2, KVM_EXIT_IO_OUT};
 use std::{
-    arch::x86_64::CpuidResult,
-    ffi::{c_int, CString},
+    ffi::CString,
     io::{self, Write},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
     ptr::NonNull,
 };
 use xmas_elf::ElfFile;
 
 use libc::{
-    __u64, close, ioctl, mmap, MAP_ANON, MAP_FAILED, MAP_SHARED, O_RDWR, PROT_READ, PROT_WRITE,
-    _IO, _IOR, _IOW, _IOWR,
+    __u64, ioctl, mmap, MAP_ANON, MAP_FAILED, MAP_SHARED, O_RDWR, PROT_READ, PROT_WRITE, _IO, _IOR,
+    _IOW, _IOWR,
 };
 
 use crate::bootparams::{__u8, boot_params, CAN_USE_HEAP, KEEP_SEGMENTS};
@@ -195,7 +193,7 @@ pub struct kvm_sregs {
 }
 
 pub struct VCpu {
-    pub fd: c_int,
+    pub fd: OwnedFd,
     pub run_ptr: NonNull<kvm_run>,
     pub mmap_size: usize,
 }
@@ -228,11 +226,11 @@ struct kvm_run {
 }
 
 struct Kvm {
-    fd: c_int,
+    fd: OwnedFd,
 }
 
 impl VCpu {
-    fn init_cpuid(&self, kvm_fd: c_int) -> Result<()> {
+    fn init_cpuid(&self, kvm_fd: BorrowedFd) -> Result<()> {
         use kvm_bindings::fam_wrappers::CpuId;
         const KVM_CPUID_SIGNATURE: u32 = 0x40000000;
         const KVM_CPUID_FEATURES: u32 = 0x40000001;
@@ -242,7 +240,7 @@ impl VCpu {
         // Casting the pointer to our wrapper as a pointer to the header
         let ret = unsafe {
             ioctl(
-                kvm_fd,
+                kvm_fd.as_raw_fd(),
                 KVM_GET_SUPPORTED_CPUID,
                 cpuid.as_mut_fam_struct_ptr(),
             )
@@ -263,7 +261,13 @@ impl VCpu {
 
         // 3. Apply these features to our VCPU
         // remember that we input a mutable reference in last ioctl
-        let ret = unsafe { ioctl(self.fd, KVM_SET_CPUID2, cpuid.as_mut_fam_struct_ptr()) };
+        let ret = unsafe {
+            ioctl(
+                self.fd.as_raw_fd(),
+                KVM_SET_CPUID2,
+                cpuid.as_mut_fam_struct_ptr(),
+            )
+        };
         if ret < 0 {
             return Err(io::Error::last_os_error()).context("KVM_SET_CPUID2 failed");
         }
@@ -303,7 +307,7 @@ impl VCpu {
 
         let mut sregs = kvm_sregs::default();
         // Get the current sregs first to avoid wiping other important deafaults
-        let ret = unsafe { ioctl(self.fd, KVM_GET_SREGS, &mut sregs, 0) };
+        let ret = unsafe { ioctl(self.fd.as_raw_fd(), KVM_GET_SREGS, &mut sregs, 0) };
         if ret < 0 {
             return Err(io::Error::last_os_error()).context("failed to get current sregs");
         }
@@ -353,7 +357,7 @@ impl VCpu {
         // Enable long mode in efer
         sregs.efer |= EFER_LMA | EFER_LME;
 
-        let ret = unsafe { ioctl(self.fd, KVM_SET_SREGS, &sregs, 0) };
+        let ret = unsafe { ioctl(self.fd.as_raw_fd(), KVM_SET_SREGS, &sregs, 0) };
         if ret < 0 {
             return Err(io::Error::last_os_error()).context("failed to set current sregs");
         }
@@ -364,7 +368,7 @@ impl VCpu {
     fn init_registers(&self, rip: __u64, rsi: __u64) -> Result<()> {
         let mut regs = kvm_regs::default();
 
-        let ret = unsafe { ioctl(self.fd, KVM_GET_REGS, &mut regs, 0) };
+        let ret = unsafe { ioctl(self.fd.as_raw_fd(), KVM_GET_REGS, &mut regs, 0) };
         if ret < 0 {
             return Err(io::Error::last_os_error()).context("failed to get current sregs");
         }
@@ -373,7 +377,7 @@ impl VCpu {
         regs.rip = rip;
         regs.rsi = rsi;
 
-        let ret = unsafe { ioctl(self.fd, KVM_SET_REGS, &mut regs, 0) };
+        let ret = unsafe { ioctl(self.fd.as_raw_fd(), KVM_SET_REGS, &mut regs, 0) };
         if ret < 0 {
             return Err(io::Error::last_os_error())
                 .context("failed to get supported cpuid features");
@@ -418,7 +422,7 @@ impl VCpu {
 
     fn run(&self) -> Result<()> {
         loop {
-            let ret = unsafe { ioctl(self.fd, KVM_RUN, 0) };
+            let ret = unsafe { ioctl(self.fd.as_raw_fd(), KVM_RUN, 0) };
             if ret < 0 {
                 return Err(io::Error::last_os_error())
                     .context("failed to get supported cpuid features");
@@ -494,28 +498,22 @@ impl VCpu {
     }
 }
 
-impl Drop for VCpu {
-    fn drop(&mut self) {
-        unsafe {
-            close(self.fd);
-        }
-    }
-}
-
 impl Kvm {
     fn new() -> Result<Self> {
         let kvm_path = CString::new("/dev/kvm")?;
         let kvm_fd = unsafe { libc::open(kvm_path.as_ptr(), O_RDWR) };
 
         if kvm_fd >= 0 {
-            Ok(Self { fd: kvm_fd })
+            Ok(Self {
+                fd: unsafe { OwnedFd::from_raw_fd(kvm_fd) },
+            })
         } else {
             Err(io::Error::last_os_error()).context("failed to open /dev/kvm")
         }
     }
 
     fn setup(&self) -> Result<()> {
-        let version = unsafe { ioctl(self.fd, KVM_GET_API_VERSION, 0) };
+        let version = unsafe { ioctl(self.fd.as_raw_fd(), KVM_GET_API_VERSION, 0) };
         if version < 0 {
             return Err(io::Error::last_os_error()).context("failed to read kvm version");
         }
@@ -528,17 +526,9 @@ impl Kvm {
     }
 }
 
-impl Drop for Kvm {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fd);
-        }
-    }
-}
-
 pub struct VM {
     kvm: Kvm,
-    pub fd: c_int,
+    pub fd: OwnedFd,
     vcpus_fd: Vec<VCpu>,
     memory_regions: kvm_userspace_memory_region,
 }
@@ -548,11 +538,12 @@ impl VM {
         let kvm = Kvm::new()?;
         kvm.setup()?;
 
-        let fd = unsafe { ioctl(kvm.fd, KVM_CREATE_VM, 0) };
+        let fd = unsafe { ioctl(kvm.fd.as_raw_fd(), KVM_CREATE_VM, 0) };
         if fd >= 0 {
             Ok(Self {
                 kvm,
-                fd,
+                // should be safe because fd is confirmed validity
+                fd: unsafe { OwnedFd::from_raw_fd(fd) },
                 vcpus_fd: Vec::new(),
                 memory_regions: kvm_userspace_memory_region::default(),
             })
@@ -563,26 +554,33 @@ impl VM {
 
     pub fn setup_irqchip(&self) -> Result<()> {
         // TSS ADDR
-        let ret = unsafe { ioctl(self.fd, KVM_SET_TSS_ADDR, ADDR_TSS, 0) };
+        let ret = unsafe { ioctl(self.fd.as_raw_fd(), KVM_SET_TSS_ADDR, ADDR_TSS, 0) };
         if ret < 0 {
             return Err(io::Error::last_os_error()).context("KVM_SET_TSS_ADDR failed");
         }
 
         // IDENTITY mapping
-        let ret = unsafe { ioctl(self.fd, KVM_SET_IDENTITY_MAP_ADDR, &ADDR_IDENTITY_MAP, 0) };
+        let ret = unsafe {
+            ioctl(
+                self.fd.as_raw_fd(),
+                KVM_SET_IDENTITY_MAP_ADDR,
+                &ADDR_IDENTITY_MAP,
+                0,
+            )
+        };
         if ret < 0 {
             return Err(io::Error::last_os_error()).context("KVM_SET_IDENTITY_MAP_ADDR failed");
         }
 
         // Create in-kernel APIC
-        let ret = unsafe { ioctl(self.fd, KVM_CREATE_IRQCHIP, 0) };
+        let ret = unsafe { ioctl(self.fd.as_raw_fd(), KVM_CREATE_IRQCHIP, 0) };
         if ret < 0 {
             return Err(io::Error::last_os_error()).context("KVM_CREATE_IRQCHIP failed");
         }
 
         // Create PIT (timer)
         let pit_config = kvm_pit_config::default();
-        let ret = unsafe { ioctl(self.fd, KVM_CREATE_PIT2, &pit_config) };
+        let ret = unsafe { ioctl(self.fd.as_raw_fd(), KVM_CREATE_PIT2, &pit_config) };
         if ret < 0 {
             return Err(io::Error::last_os_error()).context("KVM_CREATE_PIT2 failed");
         }
@@ -619,7 +617,14 @@ impl VM {
             guest_phys_addr: guest_pa,
         };
 
-        let ret = unsafe { ioctl(self.fd, KVM_SET_USER_MEMORY_REGION, &mem_region, 0) };
+        let ret = unsafe {
+            ioctl(
+                self.fd.as_raw_fd(),
+                KVM_SET_USER_MEMORY_REGION,
+                &mem_region,
+                0,
+            )
+        };
 
         if ret < 0 {
             Err(io::Error::last_os_error()).context("cannot insert memory region")
@@ -630,13 +635,13 @@ impl VM {
     }
 
     pub fn create_vcpu(&mut self) -> Result<()> {
-        let map_size = unsafe { ioctl(self.kvm.fd, KVM_GET_VCPU_MMAP_SIZE, 0) };
+        let map_size = unsafe { ioctl(self.kvm.fd.as_raw_fd(), KVM_GET_VCPU_MMAP_SIZE, 0) };
         if map_size < 0 {
             return Err(io::Error::last_os_error()).context("cannot get vcpu mmap size");
         }
 
         // Create the first and only VCPU
-        let vcpu_fd = unsafe { ioctl(self.fd, KVM_CREATE_VCPU, 0) };
+        let vcpu_fd = unsafe { ioctl(self.fd.as_raw_fd(), KVM_CREATE_VCPU, 0) };
         // mmap memory region for kvm run map
         let addr = unsafe {
             mmap(
@@ -656,7 +661,7 @@ impl VM {
         let kvm_run_mmap = NonNull::new(addr as *mut kvm_run).ok_or_else(|| anyhow!("no value"))?;
 
         self.vcpus_fd.push(VCpu {
-            fd: vcpu_fd,
+            fd: unsafe { OwnedFd::from_raw_fd(vcpu_fd) },
             run_ptr: kvm_run_mmap,
             mmap_size: map_size as usize,
         });
@@ -781,18 +786,9 @@ impl VM {
         // actually we only have one cpu
         for vcpu in &self.vcpus_fd {
             vcpu.init_registers(entry, ADDR_BOOT_PARAMS as __u64)?;
-            vcpu.init_cpuid(self.kvm.fd)?;
+            vcpu.init_cpuid(self.kvm.fd.as_fd())?;
             vcpu.run()?;
         }
         Ok(())
-    }
-}
-
-impl Drop for VM {
-    fn drop(&mut self) {
-        // Don't need to close kvm fd here, the Kvm::Drop already do it
-        unsafe {
-            libc::close(self.fd);
-        }
     }
 }

@@ -14,7 +14,6 @@
  */
 
 // Copied from linux-loader crate
-
 #[repr(C)]
 #[derive(Default)]
 pub struct __IncompleteArrayField<T>(::std::marker::PhantomData<T>, [T; 0]);

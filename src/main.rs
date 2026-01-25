@@ -1,3 +1,4 @@
+#![allow(warnings)]
 mod bootparams;
 mod kvm;
 use std::{env, fs::File, io::Read};
