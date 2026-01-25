@@ -1,6 +1,7 @@
 #![allow(warnings)]
 mod bootparams;
 mod kvm;
+mod memory;
 use std::{env, fs::File, io::Read};
 
 use crate::kvm::VM;

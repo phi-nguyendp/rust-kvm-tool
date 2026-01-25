@@ -13,7 +13,10 @@ use libc::{
     _IOW, _IOWR,
 };
 
-use crate::bootparams::{__u8, boot_params, CAN_USE_HEAP, KEEP_SEGMENTS};
+use crate::{
+    bootparams::{__u8, boot_params, CAN_USE_HEAP, KEEP_SEGMENTS},
+    memory::MemoryWrapper,
+};
 
 const KVMIO: u32 = 0xae;
 const KVM_GET_API_VERSION: libc::c_ulong = 0xae00;
@@ -201,11 +204,11 @@ pub struct VCpu {
 #[repr(C)]
 #[derive(Default)]
 struct kvm_userspace_memory_region {
-    pub slot: u32,            // An index for this memory slot
-    pub flags: u32,           // Flags
-    pub guest_phys_addr: u64, // Where the guest thinks its RAM starts
-    pub memory_size: u64,     // How many bytes of RAM
-    pub userspace_addr: u64,  // userspace_addr
+    pub slot: u32,                     // An index for this memory slot
+    pub flags: u32,                    // Flags
+    pub guest_phys_addr: u64,          // Where the guest thinks its RAM starts
+    pub memory_size: u64,              // How many bytes of RAM
+    pub userspace_addr: MemoryWrapper, // userspace_addr
 }
 #[repr(C)]
 #[derive(Debug)]
@@ -594,25 +597,11 @@ impl VM {
         mem_size: u64,
         guest_pa: u64,
     ) -> Result<()> {
-        let addr = unsafe {
-            mmap(
-                core::ptr::null_mut(),
-                mem_size as usize,
-                PROT_READ | PROT_WRITE,
-                MAP_ANON | MAP_SHARED,
-                -1,
-                0,
-            )
-        };
-
-        if addr == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error()).context("failed to map memory region");
-        }
-
+        let host_memory = MemoryWrapper::new(mem_size)?;
         let mem_region = kvm_userspace_memory_region {
             slot,
             flags,
-            userspace_addr: addr as u64,
+            userspace_addr: host_memory,
             memory_size: mem_size,
             guest_phys_addr: guest_pa,
         };
@@ -673,7 +662,7 @@ impl VM {
         for cpu in &self.vcpus_fd {
             let mem: &mut [u8] = unsafe {
                 std::slice::from_raw_parts_mut(
-                    self.memory_regions.userspace_addr as *mut u8,
+                    self.memory_regions.userspace_addr.as_mut_ptr(),
                     self.memory_regions.memory_size as usize,
                 )
             };
@@ -754,7 +743,7 @@ impl VM {
 
                 // Copy data from the ELF into guest memory
                 unsafe {
-                    let dest = self.memory_regions.userspace_addr as *mut u8;
+                    let dest = self.memory_regions.userspace_addr.as_mut_ptr();
                     let src = vmlinux[offset..(offset + file_size)].as_ptr();
 
                     std::ptr::copy_nonoverlapping(src, dest.add(paddr), file_size);
@@ -770,12 +759,15 @@ impl VM {
             let src: *const boot_params = &boot_params as *const boot_params;
             std::ptr::copy_nonoverlapping(
                 src as *const u8,
-                (self.memory_regions.userspace_addr as *mut u8).add(0x10000),
+                self.memory_regions.userspace_addr.as_mut_ptr().add(0x10000),
                 size_of_val(&boot_params),
             );
             std::ptr::copy_nonoverlapping(
                 CMDLINE.as_ptr(),
-                (self.memory_regions.userspace_addr as *mut u8).add(ADDR_CMDLINE),
+                self.memory_regions
+                    .userspace_addr
+                    .as_mut_ptr()
+                    .add(ADDR_CMDLINE),
                 CMDLINE.len(),
             );
         }
