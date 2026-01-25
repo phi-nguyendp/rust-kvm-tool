@@ -1,19 +1,18 @@
 use anyhow::{anyhow, Context, Result};
-use kvm_bindings::{kvm_run__bindgen_ty_1, kvm_run__bindgen_ty_2, KVM_EXIT_IO_OUT};
+use kvm_bindings::{
+    kvm_cpuid2, kvm_cpuid_entry2, kvm_run__bindgen_ty_1, kvm_run__bindgen_ty_2, KVM_EXIT_IO_OUT,
+};
 use std::{
     arch::x86_64::CpuidResult,
-    error::Error,
-    ffi::{c_int, c_void, CString},
-    intrinsics::copy_nonoverlapping,
+    ffi::{c_int, CString},
     io::{self, Write},
-    mem::MaybeUninit,
     ptr::NonNull,
 };
-use xmas_elf::{header::Type, symbol_table::Visibility, ElfFile};
+use xmas_elf::ElfFile;
 
 use libc::{
-    __u64, close, dirent, ioctl, mmap, MAP_ANON, MAP_FAILED, MAP_SHARED, O_RDWR, PROT_READ,
-    PROT_WRITE, _IO, _IOR, _IOW, _IOWR,
+    __u64, close, ioctl, mmap, MAP_ANON, MAP_FAILED, MAP_SHARED, O_RDWR, PROT_READ, PROT_WRITE,
+    _IO, _IOR, _IOW, _IOWR,
 };
 
 use crate::bootparams::{__u8, boot_params, CAN_USE_HEAP, KEEP_SEGMENTS};
@@ -24,8 +23,8 @@ const KVM_CREATE_VM: libc::c_ulong = 0xae01;
 const KVM_SET_USER_MEMORY_REGION: libc::c_ulong = 0x4020ae46;
 const KVM_CREATE_VCPU: libc::c_ulong = 0xae41;
 const KVM_GET_VCPU_MMAP_SIZE: libc::c_ulong = 0xae04;
-const KVM_GET_SUPPORTED_CPUID: libc::c_ulong = 0xc008ae05;
-const KVM_SET_CPUID2: libc::c_ulong = 0x4008ae90;
+const KVM_GET_SUPPORTED_CPUID: libc::c_ulong = _IOWR::<kvm_cpuid2>(KVMIO, 0x5);
+const KVM_SET_CPUID2: libc::c_ulong = _IOW::<kvm_cpuid2>(KVMIO, 0x90);
 
 const KVM_GET_SREGS: libc::c_ulong = _IOR::<kvm_sregs>(KVMIO, 0x83);
 const KVM_SET_SREGS: libc::c_ulong = _IOW::<kvm_sregs>(KVMIO, 0x84);
@@ -34,7 +33,16 @@ const KVM_GET_REGS: libc::c_ulong = _IOR::<kvm_regs>(KVMIO, 0x81);
 const KVM_SET_REGS: libc::c_ulong = _IOW::<kvm_regs>(KVMIO, 0x82);
 const KVM_RUN: libc::c_ulong = _IO(KVMIO, 0x80);
 
-const KVM_MAX_CPUID_ENTRIES: usize = 100;
+// Inkernl-IRQ
+const KVM_CREATE_IRQCHIP: libc::c_ulong = _IO(KVMIO, 0x60);
+const KVM_CREATE_PIT2: libc::c_ulong = _IOW::<kvm_pit_config>(KVMIO, 0x77);
+
+// TSS
+const KVM_SET_TSS_ADDR: libc::c_ulong = _IO(KVMIO, 0x47);
+// IDENTITY
+const KVM_SET_IDENTITY_MAP_ADDR: libc::c_ulong = _IOW::<__u64>(KVMIO, 0x48);
+
+const KVM_MAX_CPUID_ENTRIES: usize = 80;
 
 // Exit reason
 const KVM_EXIT_IO: u32 = 2;
@@ -45,6 +53,33 @@ const KVM_EXIT_HLT: u32 = 5;
 const ADDR_BOOT_PARAMS: __u64 = 0x10000;
 const ADDR_CMDLINE: usize = 0x20000;
 const CMDLINE: &[u8] = b"console=ttyS0 earlyprintk=ttyS0";
+const ADDR_TSS: __u64 = 0xffff_d000;
+const ADDR_IDENTITY_MAP: __u64 = 0xffff_c000;
+
+// for IO
+const COM1_PORT: u16 = 0x3f8;
+const COM1_DATA: u16 = 0x3f8; // Data register
+const COM1_IER: u16 = 0x3f9; // Interrupt Enable
+const COM1_IIR: u16 = 0x3fa; // Interrupt ID (read) / FIFO ctrl (write)
+const COM1_LCR: u16 = 0x3fb; // Line Control
+const COM1_MCR: u16 = 0x3fc; // Modem Control
+const COM1_LSR: u16 = 0x3fd; // Line Status
+const COM1_MSR: u16 = 0x3fe; // Modem Status
+
+// CR
+const X86_CR0_PE: u64 = 0x1;
+const X86_CR4_PAE: u64 = 0x20;
+const X86_CR4_PSE: u64 = 0x10;
+const X86_CR0_PG: u64 = 0x80000000;
+const EFER_LME: u64 = 0x100;
+const EFER_LMA: u64 = 0x400;
+
+#[repr(C)]
+#[derive(Default)]
+struct kvm_pit_config {
+    flags: u32,
+    pad: [u32; 15],
+}
 
 #[repr(C)]
 #[derive(Default)]
@@ -89,7 +124,7 @@ pub struct kvm_segment {
 const fn seg_with_st(selector_index: u16, type_: u8) -> kvm_segment {
     kvm_segment {
         base: 0,
-        limit: 0xfffffff,
+        limit: 0xffffffff,
         selector: selector_index << 3,
         // 0b1011: Code, Executed/Read, accessed
         // 0b0011: Data, Read/Write, accessed
@@ -97,9 +132,9 @@ const fn seg_with_st(selector_index: u16, type_: u8) -> kvm_segment {
         present: 1,
         dpl: 0,
         // If L-bit is set, then D-bit must be cleared.
-        db: 0,
+        db: if type_ == 0b1011 { 0 } else { 1 },
         s: 1,
-        l: 1,
+        l: if type_ == 0b1011 { 1 } else { 0 },
         g: 1,
         avl: 0,
         padding: 0,
@@ -159,36 +194,6 @@ pub struct kvm_sregs {
     pub interrupt_bitmap: [u64; 4],
 }
 
-#[repr(C)]
-#[derive(Debug, Copy, Clone, Default)]
-pub struct kvm_cpuid_entry2 {
-    pub function: u32,
-    pub index: u32,
-    pub flags: u32,
-    pub eax: u32,
-    pub ebx: u32,
-    pub ecx: u32,
-    pub edx: u32,
-    pub padding: [u32; 3],
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone, Default)]
-pub struct kvm_cpuid2 {
-    pub nent: u32,
-    pub padding: u32,
-    // The kernel expects entries to follow immediately.
-    // In our wrapper, they will be adjacent.
-    pub entries: [kvm_cpuid_entry2; 0],
-}
-
-// The wrapper we discussed
-#[repr(C)]
-pub struct CpuidWrapper {
-    pub header: kvm_cpuid2,
-    pub entries: [kvm_cpuid_entry2; KVM_MAX_CPUID_ENTRIES],
-}
-
 pub struct VCpu {
     pub fd: c_int,
     pub run_ptr: NonNull<kvm_run>,
@@ -228,27 +233,37 @@ struct Kvm {
 
 impl VCpu {
     fn init_cpuid(&self, kvm_fd: c_int) -> Result<()> {
+        use kvm_bindings::fam_wrappers::CpuId;
+        const KVM_CPUID_SIGNATURE: u32 = 0x40000000;
+        const KVM_CPUID_FEATURES: u32 = 0x40000001;
         // 1. Prepare the wrapper with space for 100 entries
-        let mut cpuid = CpuidWrapper {
-            header: kvm_cpuid2 {
-                nent: KVM_MAX_CPUID_ENTRIES as u32,
-                padding: 0,
-                entries: [],
-            },
-            entries: [Default::default(); KVM_MAX_CPUID_ENTRIES],
-        };
-
+        let mut cpuid = CpuId::new(KVM_MAX_CPUID_ENTRIES)?;
         // 2. Ask KVM to fill the supported features
         // Casting the pointer to our wrapper as a pointer to the header
-        let ret = unsafe { ioctl(kvm_fd, KVM_GET_SUPPORTED_CPUID, &mut cpuid.header) };
+        let ret = unsafe {
+            ioctl(
+                kvm_fd,
+                KVM_GET_SUPPORTED_CPUID,
+                cpuid.as_mut_fam_struct_ptr(),
+            )
+        };
         if ret < 0 {
             return Err(io::Error::last_os_error())
                 .context("failed to get supported cpuid features");
         }
 
+        for entry in cpuid.as_mut_slice().iter_mut() {
+            if entry.function == KVM_CPUID_SIGNATURE {
+                entry.eax = KVM_CPUID_FEATURES;
+                entry.ebx = 0x4b4d564b;
+                entry.ecx = 0x564b4d56;
+                entry.edx = 0x4d;
+            }
+        }
+
         // 3. Apply these features to our VCPU
         // remember that we input a mutable reference in last ioctl
-        let ret = unsafe { ioctl(self.fd, KVM_SET_CPUID2, &cpuid.header) };
+        let ret = unsafe { ioctl(self.fd, KVM_SET_CPUID2, cpuid.as_mut_fam_struct_ptr()) };
         if ret < 0 {
             return Err(io::Error::last_os_error()).context("KVM_SET_CPUID2 failed");
         }
@@ -323,21 +338,21 @@ impl VCpu {
             )
         };
         // copy
-        mem[16..16 + gdt_bytes.len()].copy_from_slice(gdt_bytes);
+        mem[0x500..0x500 + gdt_bytes.len()].copy_from_slice(gdt_bytes);
 
-        sregs.gdt.base = 0x0; // we put it at 0x0
+        sregs.gdt.base = 0x500; // we put it at 0x0
         sregs.gdt.limit = std::mem::size_of_val(&gdt_table) as u16 - 1;
 
-        // PAE enabling
-        sregs.cr4 = 1 << 5;
-        sregs.cr4 |= 0x600;
-
-        // Enable long mode in efer
-        sregs.efer = 0x500; // Long Mode enable and active
-
         // Setup page table
-        sregs.cr3 = 0x2000;
-        sregs.cr0 = 0x80050033;
+        sregs.cr3 = pml4_addr;
+        sregs.cr0 |= X86_CR0_PE;
+        sregs.cr0 |= X86_CR0_PG;
+
+        // PAE enabling
+        sregs.cr4 |= X86_CR4_PAE | X86_CR4_PSE;
+        // Enable long mode in efer
+        sregs.efer |= EFER_LMA | EFER_LME;
+
         let ret = unsafe { ioctl(self.fd, KVM_SET_SREGS, &sregs, 0) };
         if ret < 0 {
             return Err(io::Error::last_os_error()).context("failed to set current sregs");
@@ -367,6 +382,40 @@ impl VCpu {
         Ok(())
     }
 
+    fn handle_io(&self, kvm_run: &kvm_run) -> Result<()> {
+        let io = unsafe { kvm_run.__bindgen_anon_1.io };
+        let port = io.port;
+        let is_out = io.direction as u32 == KVM_EXIT_IO_OUT;
+        let data_ptr = unsafe { (self.run_ptr.as_ptr() as *mut u8).add(io.data_offset as usize) };
+
+        match (port, is_out) {
+            (COM1_DATA, true) => {
+                let ch = unsafe { *data_ptr } as char;
+                print!("{}", ch);
+                _ = std::io::stdout().flush();
+            }
+            (COM1_LSR, false) => {
+                // Return: Transmitter empty (0x20) | Transmitter holding register empty (0x40)
+                unsafe {
+                    *data_ptr = 0x60;
+                }
+            }
+            (0x61, false) => unsafe {
+                *data_ptr = 0x20;
+            },
+            (COM1_IER..=COM1_MSR, _) => {
+                // Ignore other UART register accesses
+                if !is_out {
+                    unsafe {
+                        *data_ptr = 0;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn run(&self) -> Result<()> {
         loop {
             let ret = unsafe { ioctl(self.fd, KVM_RUN, 0) };
@@ -393,22 +442,53 @@ impl VCpu {
             */
             match kvm_run.exit_reason {
                 KVM_EXIT_IO => {
-                    let io = unsafe { kvm_run.__bindgen_anon_1.io };
-                    let port = io.port;
-                    let dir = io.direction as u32;
-                    if dir == KVM_EXIT_IO_OUT && port == 0x3f8u16 {
-                        let offset = unsafe { kvm_run.__bindgen_anon_1.io.data_offset } as usize;
-                        let character =
-                            unsafe { *((self.run_ptr.as_ptr() as *mut u8).add(offset)) } as char;
-                        print!("{}", character);
-                        _ = std::io::stdout().flush();
-                    }
+                    self.handle_io(kvm_run)?;
                 }
                 KVM_EXIT_HLT => {
                     println!("Guest executed HLT. Stopping.");
                     break Ok(());
                 }
-                _ => {}
+                un => {
+                    /*
+                    let fail_reason = unsafe {
+                        kvm_run
+                            .__bindgen_anon_1
+                            .fail_entry
+                            .hardware_entry_failure_reason
+                    };
+                    println!(
+                        "exit reason {} : hardware_entry_failure_reason = {:#x}",
+                        un, fail_reason
+                    );
+
+                    // Dump CPU state for debugging
+                    let mut sregs = kvm_sregs::default();
+                    unsafe { ioctl(self.fd, KVM_GET_SREGS, &mut sregs, 0) };
+                    println!(
+                        "  CR0={:#x} CR3={:#x} CR4={:#x} EFER={:#x}",
+                        sregs.cr0, sregs.cr3, sregs.cr4, sregs.efer
+                    );
+                    println!(
+                        "  CS: sel={:#x} base={:#x} limit={:#x} type={} l={} db={}",
+                        sregs.cs.selector,
+                        sregs.cs.base,
+                        sregs.cs.limit,
+                        sregs.cs.type_,
+                        sregs.cs.l,
+                        sregs.cs.db
+                    );
+                    println!(
+                        "  DS: sel={:#x} base={:#x} limit={:#x} type={} l={} db={}",
+                        sregs.ds.selector,
+                        sregs.ds.base,
+                        sregs.ds.limit,
+                        sregs.ds.type_,
+                        sregs.ds.l,
+                        sregs.ds.db
+                    );
+                    return Err(anyhow!("VM entry failed"));
+                    */
+                }
             };
         }
     }
@@ -481,6 +561,34 @@ impl VM {
         }
     }
 
+    pub fn setup_irqchip(&self) -> Result<()> {
+        // TSS ADDR
+        let ret = unsafe { ioctl(self.fd, KVM_SET_TSS_ADDR, ADDR_TSS, 0) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error()).context("KVM_SET_TSS_ADDR failed");
+        }
+
+        // IDENTITY mapping
+        let ret = unsafe { ioctl(self.fd, KVM_SET_IDENTITY_MAP_ADDR, &ADDR_IDENTITY_MAP, 0) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error()).context("KVM_SET_IDENTITY_MAP_ADDR failed");
+        }
+
+        // Create in-kernel APIC
+        let ret = unsafe { ioctl(self.fd, KVM_CREATE_IRQCHIP, 0) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error()).context("KVM_CREATE_IRQCHIP failed");
+        }
+
+        // Create PIT (timer)
+        let pit_config = kvm_pit_config::default();
+        let ret = unsafe { ioctl(self.fd, KVM_CREATE_PIT2, &pit_config) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error()).context("KVM_CREATE_PIT2 failed");
+        }
+        Ok(())
+    }
+
     pub fn insert_memory_region(
         &mut self,
         slot: u32,
@@ -502,6 +610,7 @@ impl VM {
         if addr == libc::MAP_FAILED {
             return Err(io::Error::last_os_error()).context("failed to map memory region");
         }
+
         let mem_region = kvm_userspace_memory_region {
             slot,
             flags,
@@ -621,9 +730,7 @@ impl VM {
     pub fn load_code(&self, vmlinux: &Vec<u8>) -> Result<__u64> {
         let elf = ElfFile::new(vmlinux).map_err(|e| anyhow::anyhow!(e))?;
         let mut boot_params = boot_params::default();
-        unsafe {
-            std::ptr::copy_nonoverlapping(vmlinux.as_ptr().cast(), &mut boot_params, 1);
-        }
+        boot_params = unsafe { std::mem::zeroed() };
 
         Self::setup_boot_params(
             &mut boot_params,
@@ -674,6 +781,7 @@ impl VM {
         // actually we only have one cpu
         for vcpu in &self.vcpus_fd {
             vcpu.init_registers(entry, ADDR_BOOT_PARAMS as __u64)?;
+            vcpu.init_cpuid(self.kvm.fd)?;
             vcpu.run()?;
         }
         Ok(())

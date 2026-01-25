@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.100"
-kvm-bindings = "0.14.0"
+kvm-bindings = { version = "0.14.0", features = ["fam-wrappers"] }
 libc = "0.2.180"
 thiserror = "2.0.17"
 xmas-elf = "0.10.0"

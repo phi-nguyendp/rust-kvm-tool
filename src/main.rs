@@ -16,6 +16,7 @@ fn main() -> Result<()> {
     let mut vm = VM::new().expect("unable to open VM fd");
     // 2GB ram
     vm.insert_memory_region(0, 1u32, 2 * 1024 * 1024 * 1024, 0)?;
+    vm.setup_irqchip()?;
     vm.create_vcpu()?;
     vm.enter_long_mode()?;
     let entry = vm.load_code(&code)?;
