@@ -17,6 +17,7 @@ impl Default for MemoryWrapper {
     }
 }
 
+#[allow(unused)]
 impl MemoryWrapper {
     pub fn new(mem_size: u64) -> Result<Self> {
         let addr = unsafe {

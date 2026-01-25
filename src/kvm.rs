@@ -198,7 +198,6 @@ pub struct kvm_sregs {
 pub struct VCpu {
     pub fd: OwnedFd,
     pub run_ptr: NonNull<kvm_run>,
-    pub mmap_size: usize,
 }
 
 #[repr(C)]
@@ -652,7 +651,6 @@ impl VM {
         self.vcpus_fd.push(VCpu {
             fd: unsafe { OwnedFd::from_raw_fd(vcpu_fd) },
             run_ptr: kvm_run_mmap,
-            mmap_size: map_size as usize,
         });
 
         Ok(())

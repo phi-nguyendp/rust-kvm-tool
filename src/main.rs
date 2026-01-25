@@ -1,4 +1,3 @@
-#![allow(warnings)]
 mod bootparams;
 mod kvm;
 mod memory;

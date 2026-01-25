@@ -1,3 +1,4 @@
+#![allow(warnings)]
 // Copyright (c) 2019 Intel Corporation. All rights reserved.
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
