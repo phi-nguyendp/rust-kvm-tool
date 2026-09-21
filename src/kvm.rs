@@ -772,6 +772,47 @@ impl VM {
         Ok(elf.header.pt2.entry_point())
     }
 
+    /// Loads an initramfs (cpio) image into guest memory and points the
+    /// `boot_params` already written by `load_code()` at it, so the
+    /// kernel's built-in default (looking for and exec'ing `/init` inside
+    /// the initramfs) just works with no cmdline changes needed.
+    ///
+    /// New, additive, and separate from `load_code()` on purpose: it must
+    /// run *after* `load_code()`, since it patches the `boot_params`
+    /// struct that call already wrote to guest memory.
+    pub fn load_initrd(&self, initrd: &[u8]) -> Result<__u64> {
+        // `enter_long_mode()` only identity-maps the first 512 * 2MB = 1GB
+        // of guest memory (see its page-directory setup), so anything the
+        // guest needs to reach through that early page table - including
+        // the initrd - must live below this boundary.
+        const IDENTITY_MAP_LIMIT: u64 = 512 * 0x200000;
+
+        if IDENTITY_MAP_LIMIT > self.memory_regions.memory_size {
+            return Err(anyhow!(
+                "guest memory ({} bytes) is smaller than the identity-mapped range",
+                self.memory_regions.memory_size
+            ));
+        }
+        let addr = (IDENTITY_MAP_LIMIT - initrd.len() as u64) & !0xfff;
+        if (addr as usize) < ADDR_CMDLINE + CMDLINE.len() {
+            return Err(anyhow!(
+                "initrd ({} bytes) is too large to fit below the identity-mapped range",
+                initrd.len()
+            ));
+        }
+
+        unsafe {
+            let dest = self.memory_regions.userspace_addr.as_mut_ptr();
+            std::ptr::copy_nonoverlapping(initrd.as_ptr(), dest.add(addr as usize), initrd.len());
+
+            let bp_ptr = dest.add(ADDR_BOOT_PARAMS as usize) as *mut boot_params;
+            (*bp_ptr).hdr.ramdisk_image = addr as u32;
+            (*bp_ptr).hdr.ramdisk_size = initrd.len() as u32;
+        }
+
+        Ok(addr)
+    }
+
     pub fn run(&mut self, entry: __u64) -> Result<()> {
         // actually we only have one cpu
         for vcpu in &self.vcpus_fd {

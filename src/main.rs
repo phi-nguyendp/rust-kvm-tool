@@ -22,6 +22,21 @@ fn main() -> Result<()> {
     vm.enter_long_mode()?;
     let entry = vm.load_code(&code)?;
     println!("Code will start at {:#x}", entry);
+
+    // Optional 2nd arg: an initramfs (cpio) image, e.g. built with
+    // tools/mkinitramfs.py. If given, it's loaded and the kernel's default
+    // `/init` lookup inside it takes over.
+    if let Some(initrd_path) = env::args().nth(2) {
+        let mut initrd = Vec::new();
+        File::open(initrd_path)?.read_to_end(&mut initrd)?;
+        let initrd_addr = vm.load_initrd(&initrd)?;
+        println!(
+            "Loaded initrd (size: {}) at {:#x}",
+            initrd.len(),
+            initrd_addr
+        );
+    }
+
     vm.run(entry)?;
 
     Ok(())
