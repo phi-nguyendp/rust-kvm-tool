@@ -1,0 +1,19 @@
+[package]
+name = "ktvmx"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["std"]
+# `std` is only for the host-side test helpers (mock VMCS, guest memory).
+# The stage files are `no_std` so the kernel module can include them verbatim.
+std = []
+
+[dependencies]
+libc = "0.2"
+
+[lints.rust]
+# Kernel naming (struct vcpu_vmx, VM_EXIT_*, CPU_BASED_*) is deliberate.
+non_camel_case_types = "allow"
+non_upper_case_globals = "allow"
+dead_code = "allow"
