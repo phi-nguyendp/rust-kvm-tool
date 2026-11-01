@@ -40,38 +40,28 @@ DEVICE_NODES = [
 
 EXTRA_DIRS = ["proc", "sys", "dev", "tmp", "mnt", "root"]
 
-# NOTE: this VMM's serial-port emulation (src/kvm.rs, untouched) never
-# raises the UART's IRQ, so the *standard interrupt-driven* tty write path
-# (what a normal `write()` to /dev/console goes through) stalls forever and
-# never appears on the host. Kernel printk output *does* show up, because
-# it uses a separate, synchronous/polled console-write path that doesn't
-# need an interrupt. So this script logs its progress via /dev/kmsg
-# (which feeds back into that same printk path) instead of plain echo, to
-# get a working confirmation trail on the serial console despite that
-# limitation.
+# The VMM's serial-port emulation (src/kvm.rs) now pulses COM1's IRQ4 after
+# every transmitted byte, so the normal interrupt-driven tty write path
+# (what a plain `write()`/`echo` to /dev/console goes through) no longer
+# stalls - a regular echo is enough to reach the host console.
 #
-# It deliberately does NOT end with `exec /bin/sh`: with no keyboard-input
-# emulation either, an interactive shell reads EOF on stdin immediately and
-# exits, which kills PID 1 and panics the kernel. Once someone adds IRQ +
-# input support to the VMM, swap the final loop below for `exec /bin/sh` to
-# get a real interactive console.
+# There's still no keyboard-input emulation (nothing injects guest RX
+# data), so `exec /bin/sh` below prints a real "/ #" prompt but can't be
+# typed into - the shell just blocks on read() forever, which is a mundane
+# process hang rather than the "PID 1 exits instantly" panic this used to
+# hit before the interrupt fix.
 INIT_SCRIPT = b"""#!/bin/sh
-log() {
-    echo "rust-kvm-tool-init: $*" > /dev/kmsg
-}
-
 mount -t proc none /proc
 mount -t sysfs none /sys
 mount -t devtmpfs none /dev 2>/dev/null
 
-log "busybox initramfs loaded"
-log "$(/bin/busybox uname -a)"
-log "idling here: no IRQ/keyboard-input emulation yet, so an interactive"
-log "shell would hit EOF on stdin immediately and panic PID 1 instead"
+echo
+echo "=== rust-kvm-tool: busybox initramfs loaded ==="
+/bin/busybox uname -a
+echo "Dropping to a busybox shell (exec /bin/sh)."
+echo
 
-while true; do
-    sleep 3600 2>/dev/null || :
-done
+exec /bin/sh
 """
 
 

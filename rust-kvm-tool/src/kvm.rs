@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use kvm_bindings::{kvm_cpuid2, kvm_run__bindgen_ty_1, kvm_run__bindgen_ty_2, KVM_EXIT_IO_OUT};
 use std::{
+    cell::Cell,
     ffi::CString,
     io::{self, Write},
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
@@ -37,6 +38,7 @@ const KVM_RUN: libc::c_ulong = _IO(KVMIO, 0x80);
 // Inkernl-IRQ
 const KVM_CREATE_IRQCHIP: libc::c_ulong = _IO(KVMIO, 0x60);
 const KVM_CREATE_PIT2: libc::c_ulong = _IOW::<kvm_pit_config>(KVMIO, 0x77);
+const KVM_IRQ_LINE: libc::c_ulong = _IOW::<kvm_irq_level>(KVMIO, 0x61);
 
 // TSS
 const KVM_SET_TSS_ADDR: libc::c_ulong = _IO(KVMIO, 0x47);
@@ -66,6 +68,9 @@ const COM1_LCR: u16 = 0x3fb; // Line Control
 const COM1_MCR: u16 = 0x3fc; // Modem Control
 const COM1_LSR: u16 = 0x3fd; // Line Status
 const COM1_MSR: u16 = 0x3fe; // Modem Status
+// COM1 is wired to legacy ISA IRQ4, identity-mapped to GSI 4 by KVM's
+// default in-kernel PIC/IOAPIC routing (set up by KVM_CREATE_IRQCHIP).
+const COM1_IRQ: u32 = 4;
 
 // CR
 const X86_CR0_PE: u64 = 0x1;
@@ -80,6 +85,15 @@ const EFER_LMA: u64 = 0x400;
 struct kvm_pit_config {
     flags: u32,
     pad: [u32; 15],
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct kvm_irq_level {
+    // Real header has this as a union with `status` (only meaningful for
+    // KVM_IRQ_LINE_STATUS); we only ever set it, so a plain u32 is enough.
+    irq: u32,
+    level: u32,
 }
 
 #[repr(C)]
@@ -198,6 +212,22 @@ pub struct kvm_sregs {
 pub struct VCpu {
     pub fd: OwnedFd,
     pub run_ptr: NonNull<kvm_run>,
+    // Minimal stored UART register state. These specifically exist because
+    // the guest's 8250 driver probes them during autoconfig() (see
+    // handle_io) to decide whether a UART is even present - without
+    // tracking real IER/MCR values, that probe fails and the port is left
+    // as PORT_UNKNOWN, which means the driver never opens it for real (no
+    // request_irq, no interrupt-driven tx) even though kernel printk still
+    // works fine via its separate polled console-write path.
+    com1_ier: Cell<u8>,
+    com1_mcr: Cell<u8>,
+    // Whether there's a THRE ("transmit register empty") interrupt the
+    // guest hasn't acknowledged yet. Real hardware clears this the moment
+    // IIR is read with THRE as the reported cause; without that, the
+    // driver's ISR sees IIR permanently claim "still pending" and spins
+    // until it hits its own safety limit (logging "too much work for
+    // irqN") instead of ever seeing "nothing to do".
+    com1_thre_pending: Cell<bool>,
 }
 
 #[repr(C)]
@@ -388,7 +418,25 @@ impl VCpu {
         Ok(())
     }
 
-    fn handle_io(&self, kvm_run: &kvm_run) -> Result<()> {
+    // Pulses (raises then lowers) a legacy ISA IRQ line through the VM's
+    // in-kernel PIC/IOAPIC, the way real edge-triggered ISA devices signal
+    // a single event. `vm_fd` is the *VM* fd (KVM_IRQ_LINE is a VM-level
+    // ioctl, unlike the vcpu-level ones this struct otherwise deals with).
+    fn pulse_irq(vm_fd: BorrowedFd, irq: u32) -> Result<()> {
+        let mut level = kvm_irq_level { irq, level: 1 };
+        let ret = unsafe { ioctl(vm_fd.as_raw_fd(), KVM_IRQ_LINE, &level) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error()).context("KVM_IRQ_LINE (raise) failed");
+        }
+        level.level = 0;
+        let ret = unsafe { ioctl(vm_fd.as_raw_fd(), KVM_IRQ_LINE, &level) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error()).context("KVM_IRQ_LINE (lower) failed");
+        }
+        Ok(())
+    }
+
+    fn handle_io(&self, kvm_run: &kvm_run, vm_fd: BorrowedFd) -> Result<()> {
         let io = unsafe { kvm_run.__bindgen_anon_1.io };
         let port = io.port;
         let is_out = io.direction as u32 == KVM_EXIT_IO_OUT;
@@ -399,6 +447,25 @@ impl VCpu {
                 let ch = unsafe { *data_ptr } as char;
                 print!("{}", ch);
                 _ = std::io::stdout().flush();
+                // The kernel's own printk output bypasses the tty layer
+                // entirely (it polls LSR and writes directly), so it never
+                // needed this. But a normal userspace write() goes through
+                // the standard interrupt-driven 8250 tty driver, which only
+                // sends the *first* burst synchronously and then waits for a
+                // THRE interrupt to send the rest - one we never used to
+                // raise, so it would just stall forever. Pulsing IRQ4 here
+                // tells the driver "the byte you just wrote is gone, come
+                // send more", matching what real hardware would do.
+                //
+                // Real hardware only ever raises this when IER's THRI bit is
+                // enabled - and gating on that matters here, not just for
+                // accuracy: unconditionally pulsing during early boot, before
+                // the driver has enabled it, spams interrupts nobody asked
+                // for.
+                if self.com1_ier.get() & 0x02 != 0 {
+                    self.com1_thre_pending.set(true);
+                    Self::pulse_irq(vm_fd, COM1_IRQ)?;
+                }
             }
             (COM1_LSR, false) => {
                 // Return: Transmitter empty (0x20) | Transmitter holding register empty (0x40)
@@ -406,11 +473,65 @@ impl VCpu {
                     *data_ptr = 0x60;
                 }
             }
+            (COM1_IIR, false) => {
+                // Interrupt ID. Bit 0 clear = an interrupt is pending; bits
+                // 2:1 = 01 identifies THRE (transmit-empty), the only cause
+                // we ever raise. Reading it while THRE is the reported cause
+                // is how real hardware acknowledges/clears that interrupt -
+                // skipping that (i.e. always reporting "pending") makes the
+                // driver's ISR loop internally until it hits its own safety
+                // limit, logging "too much work for irqN".
+                let iir = if self.com1_thre_pending.take() { 0x02 } else { 0x01 };
+                unsafe {
+                    *data_ptr = iir;
+                }
+            }
+            // IER and MCR need to be real, stored registers - not because
+            // anything reads them for their own sake, but because the 8250
+            // driver's autoconfig() probes them at boot to decide whether a
+            // UART is even present:
+            //   - it writes 0 then 0x0F to IER and expects to read back
+            //     exactly that, to rule out a floating/non-existent port;
+            //   - it puts MCR into loopback mode and expects MSR to reflect
+            //     MCR's RTS/DTR/OUT1/OUT2 bits on CTS/DSR/RI/DCD.
+            // Fail either check and the port is left as PORT_UNKNOWN, which
+            // means the driver never actually opens it (no request_irq, no
+            // interrupt-driven tx) - so this isn't optional polish, it's
+            // what makes the IRQ pulse above ever get listened to.
+            (COM1_IER, true) => {
+                self.com1_ier.set(unsafe { *data_ptr });
+            }
+            (COM1_IER, false) => unsafe {
+                *data_ptr = self.com1_ier.get();
+            },
+            (COM1_MCR, true) => {
+                self.com1_mcr.set(unsafe { *data_ptr });
+            }
+            (COM1_MCR, false) => unsafe {
+                *data_ptr = self.com1_mcr.get();
+            },
+            (COM1_MSR, false) => {
+                let mcr = self.com1_mcr.get();
+                let msr = if mcr & 0x10 != 0 {
+                    // Loopback: MCR's DTR/RTS/OUT1/OUT2 wire straight through
+                    // to MSR's DSR/CTS/RI/DCD.
+                    ((mcr & 0x01) << 5) // DTR -> DSR
+                        | ((mcr & 0x02) << 3) // RTS -> CTS
+                        | ((mcr & 0x04) << 4) // OUT1 -> RI
+                        | ((mcr & 0x08) << 4) // OUT2 -> DCD
+                } else {
+                    0
+                };
+                unsafe {
+                    *data_ptr = msr;
+                }
+            }
             (0x61, false) => unsafe {
                 *data_ptr = 0x20;
             },
             (COM1_IER..=COM1_MSR, _) => {
-                // Ignore other UART register accesses
+                // Ignore other UART register accesses (LCR, and any write to
+                // one of the registers we handle above by-value)
                 if !is_out {
                     unsafe {
                         *data_ptr = 0;
@@ -422,7 +543,7 @@ impl VCpu {
         Ok(())
     }
 
-    fn run(&self) -> Result<()> {
+    fn run(&self, vm_fd: BorrowedFd) -> Result<()> {
         loop {
             let ret = unsafe { ioctl(self.fd.as_raw_fd(), KVM_RUN, 0) };
             if ret < 0 {
@@ -448,7 +569,7 @@ impl VCpu {
             */
             match kvm_run.exit_reason {
                 KVM_EXIT_IO => {
-                    self.handle_io(kvm_run)?;
+                    self.handle_io(kvm_run, vm_fd)?;
                 }
                 KVM_EXIT_HLT => {
                     println!("Guest executed HLT. Stopping.");
@@ -651,6 +772,9 @@ impl VM {
         self.vcpus_fd.push(VCpu {
             fd: unsafe { OwnedFd::from_raw_fd(vcpu_fd) },
             run_ptr: kvm_run_mmap,
+            com1_ier: Cell::new(0),
+            com1_mcr: Cell::new(0),
+            com1_thre_pending: Cell::new(false),
         });
 
         Ok(())
@@ -818,7 +942,7 @@ impl VM {
         for vcpu in &self.vcpus_fd {
             vcpu.init_registers(entry, ADDR_BOOT_PARAMS as __u64)?;
             vcpu.init_cpuid(self.kvm.fd.as_fd())?;
-            vcpu.run()?;
+            vcpu.run(self.fd.as_fd())?;
         }
         Ok(())
     }
