@@ -1,2 +1,13 @@
 # SPDX-License-Identifier: GPL-2.0
 obj-m := ktvmx.o
+
+# STAGE=N (from module/Makefile, default 11) compiles only module/s01..sNN:
+# --cfg ktvmx_s01 ... --cfg ktvmx_sNN, see the #[cfg]s in ktvmx.rs.
+STAGE ?= 11
+KTVMX_STAGES := 01 02 03 04 05 06 07 08 09 10 11
+rustflags-y += $(foreach n,$(wordlist 1,$(STAGE),$(KTVMX_STAGES)),--cfg ktvmx_s$(n))
+rustflags-y += '--check-cfg=cfg(MODULE,$(subst $(space),$(comma),$(addprefix ktvmx_s,$(KTVMX_STAGES))))'
+
+# The kernel's CONFIG_WERROR turns every rustc lint into an error (-Dwarnings).
+# Report lints as warnings, as cargo does; real compile errors still fail.
+rustflags-y += --cap-lints=warn

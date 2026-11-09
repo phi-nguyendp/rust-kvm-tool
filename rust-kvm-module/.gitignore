@@ -2,3 +2,8 @@
 /build
 *.o
 *.bin
+qemu.log
+qemu.pid
+qemu/local.env
+qemu/build.log
+module/rust-project.json

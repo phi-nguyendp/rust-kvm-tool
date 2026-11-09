@@ -71,7 +71,10 @@ fn vmx_basic_fields_do_not_overlap() {
     assert_eq!(vmx_basic_decode(0x7fff_ffff).revision_id, 0x7fff_ffff);
     // a 13-bit size field: all ones is 8191, and nothing leaks into bits 48+.
     let b = vmx_basic_decode(0x1fff_0000_0000);
-    assert_eq!((b.vmcs_size, b.phys_addr_32bit, b.dual_monitor, b.memtype), (8191, false, false, 0));
+    assert_eq!(
+        (b.vmcs_size, b.phys_addr_32bit, b.dual_monitor, b.memtype),
+        (8191, false, false, 0)
+    );
     // an old-style part: 32-bit addresses, uncacheable VMCS, no true controls.
     let b = vmx_basic_decode((1 << 48) | (0x400 << 32) | 1);
     assert!(b.phys_addr_32bit);
@@ -93,12 +96,39 @@ fn ept_vpid_skylake() {
 fn ept_vpid_single_bits() {
     let none = ept_vpid_cap::default();
     assert_eq!(vmx_ept_vpid_decode(0), none);
-    assert_eq!(vmx_ept_vpid_decode(1 << 6), ept_vpid_cap { pwl4: true, ..none });
-    assert_eq!(vmx_ept_vpid_decode(1 << 14), ept_vpid_cap { wb: true, ..none });
-    assert_eq!(vmx_ept_vpid_decode(1 << 21), ept_vpid_cap { ad: true, ..none });
-    assert_eq!(vmx_ept_vpid_decode(1 << 26), ept_vpid_cap { invept_all: true, ..none });
-    assert_eq!(vmx_ept_vpid_decode(1 << 32), ept_vpid_cap { invvpid: true, ..none });
-    assert_eq!(vmx_ept_vpid_decode(1 << 43), ept_vpid_cap { invvpid_single_nonglobal: true, ..none });
+    assert_eq!(
+        vmx_ept_vpid_decode(1 << 6),
+        ept_vpid_cap { pwl4: true, ..none }
+    );
+    assert_eq!(
+        vmx_ept_vpid_decode(1 << 14),
+        ept_vpid_cap { wb: true, ..none }
+    );
+    assert_eq!(
+        vmx_ept_vpid_decode(1 << 21),
+        ept_vpid_cap { ad: true, ..none }
+    );
+    assert_eq!(
+        vmx_ept_vpid_decode(1 << 26),
+        ept_vpid_cap {
+            invept_all: true,
+            ..none
+        }
+    );
+    assert_eq!(
+        vmx_ept_vpid_decode(1 << 32),
+        ept_vpid_cap {
+            invvpid: true,
+            ..none
+        }
+    );
+    assert_eq!(
+        vmx_ept_vpid_decode(1 << 43),
+        ept_vpid_cap {
+            invvpid_single_nonglobal: true,
+            ..none
+        }
+    );
 }
 
 #[test]
@@ -121,7 +151,10 @@ fn probe_happy_path() {
 #[test]
 fn probe_no_vmx_is_checked_first() {
     // even with no MSRs at all, NoVmx wins: we must not touch MSRs of a CPU without VMX.
-    assert_eq!(vmx_probe(&MockMsrs::default(), 0), Err(vmx_probe_error::NoVmx));
+    assert_eq!(
+        vmx_probe(&MockMsrs::default(), 0),
+        Err(vmx_probe_error::NoVmx)
+    );
 }
 
 #[test]
@@ -137,23 +170,35 @@ fn probe_disabled_by_bios() {
 fn probe_unlocked_feature_control_asks_for_a_write() {
     let m = good_msrs().with(MSR_IA32_FEATURE_CONTROL, 0);
     let caps = vmx_probe(&m, ECX_VMX).expect("probe");
-    assert_eq!(caps.feat_ctl_write, Some(FEAT_CTL_LOCKED | FEAT_CTL_VMX_ENABLED_OUTSIDE_SMX));
+    assert_eq!(
+        caps.feat_ctl_write,
+        Some(FEAT_CTL_LOCKED | FEAT_CTL_VMX_ENABLED_OUTSIDE_SMX)
+    );
 }
 
 #[test]
 fn probe_missing_msrs() {
     let mut m = good_msrs();
     m.0.remove(&MSR_IA32_FEATURE_CONTROL);
-    assert_eq!(vmx_probe(&m, ECX_VMX), Err(vmx_probe_error::MsrMissing(MSR_IA32_FEATURE_CONTROL)));
+    assert_eq!(
+        vmx_probe(&m, ECX_VMX),
+        Err(vmx_probe_error::MsrMissing(MSR_IA32_FEATURE_CONTROL))
+    );
 
     let mut m = good_msrs();
     m.0.remove(&MSR_IA32_VMX_BASIC);
-    assert_eq!(vmx_probe(&m, ECX_VMX), Err(vmx_probe_error::MsrMissing(MSR_IA32_VMX_BASIC)));
+    assert_eq!(
+        vmx_probe(&m, ECX_VMX),
+        Err(vmx_probe_error::MsrMissing(MSR_IA32_VMX_BASIC))
+    );
 
     // EPT is advertised in the secondary controls, so its capability MSR must exist.
     let mut m = good_msrs();
     m.0.remove(&MSR_IA32_VMX_EPT_VPID_CAP);
-    assert_eq!(vmx_probe(&m, ECX_VMX), Err(vmx_probe_error::MsrMissing(MSR_IA32_VMX_EPT_VPID_CAP)));
+    assert_eq!(
+        vmx_probe(&m, ECX_VMX),
+        Err(vmx_probe_error::MsrMissing(MSR_IA32_VMX_EPT_VPID_CAP))
+    );
 }
 
 #[test]

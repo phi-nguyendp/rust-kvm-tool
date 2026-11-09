@@ -61,7 +61,10 @@ fn fixed_bits_adjust() {
     // CR4 without VMXE gets it (this is exactly what enabling VMX does)
     assert_eq!(cr_fixed_adjust(CR4_NO_VMXE, CR4_FIXED0, CR4_FIXED1), CR4);
     // bits fixed to 0 (0 in FIXED1) are cleared: bit 22 (PKE-ish) is above 0x3727ff
-    assert_eq!(cr_fixed_adjust(CR4 | (1 << 23), CR4_FIXED0, CR4_FIXED1), CR4);
+    assert_eq!(
+        cr_fixed_adjust(CR4 | (1 << 23), CR4_FIXED0, CR4_FIXED1),
+        CR4
+    );
     // fixed0 and fixed1 interplay: bit 0 fixed1=0 wins over nothing else
     assert_eq!(cr_fixed_adjust(0xf, 0, 0b1010), 0b1010);
     assert_eq!(cr_fixed_adjust(0, 0b0101, u64::MAX), 0b0101);
@@ -75,7 +78,7 @@ fn fixed_bits_check() {
     assert!(!cr_fixed_ok(CR0 & !X86_CR0_PG, CR0_FIXED0, CR0_FIXED1));
     assert!(!cr_fixed_ok(CR4_NO_VMXE, CR4_FIXED0, CR4_FIXED1));
     assert!(!cr_fixed_ok(CR4 | (1 << 23), CR4_FIXED0, CR4_FIXED1)); // fixed-0 bit set
-    // adjust always produces something ok
+                                                                    // adjust always produces something ok
     for cr in [0u64, 1, 0xdead_beef, u64::MAX, CR0, CR4] {
         let a = cr_fixed_adjust(cr, CR4_FIXED0, CR4_FIXED1);
         assert!(cr_fixed_ok(a, CR4_FIXED0, CR4_FIXED1));
@@ -97,7 +100,10 @@ fn vmxon_region_clears_bit31() {
     basic.revision_id = 0x7fff_ffff;
     let mut page = [0u8; 4096];
     vmxon_region_init(&mut page, &basic).unwrap();
-    assert_eq!(u32::from_le_bytes(page[..4].try_into().unwrap()), 0x7fff_ffff);
+    assert_eq!(
+        u32::from_le_bytes(page[..4].try_into().unwrap()),
+        0x7fff_ffff
+    );
 }
 
 #[test]
@@ -115,7 +121,10 @@ fn rflags_decoding() {
     assert_eq!(vmx_fail_kind(0x246), VmxResult::FailValid); // ZF set
     assert_eq!(vmx_fail_kind(0x203), VmxResult::FailInvalid); // CF set
     assert_eq!(vmx_fail_kind(0x202), VmxResult::Succeed); // IF does not matter
-    assert_eq!(vmx_fail_kind(X86_EFLAGS_CF | X86_EFLAGS_ZF), VmxResult::FailInvalid);
+    assert_eq!(
+        vmx_fail_kind(X86_EFLAGS_CF | X86_EFLAGS_ZF),
+        VmxResult::FailInvalid
+    );
     assert_eq!(vmx_fail_kind(0), VmxResult::Succeed);
 }
 
@@ -136,7 +145,10 @@ fn vmxon_then_vmxoff() {
 #[test]
 fn vmxon_ud_without_cr4_vmxe() {
     let mut cpu = vmx_cpu_state::new();
-    let e = vmxon_env { cr4: CR4_NO_VMXE, ..env() };
+    let e = vmxon_env {
+        cr4: CR4_NO_VMXE,
+        ..env()
+    };
     assert_eq!(cpu.vmxon(&e, REGION, 4), Err(vmx_exception::UD));
     assert!(!cpu.in_vmx);
 }
@@ -145,14 +157,57 @@ fn vmxon_ud_without_cr4_vmxe() {
 fn vmxon_gp_cases() {
     let mut cpu = vmx_cpu_state::new();
     // CPL 3
-    assert_eq!(cpu.vmxon(&vmxon_env { cpl: 3, ..env() }, REGION, 4), Err(vmx_exception::GP));
+    assert_eq!(
+        cpu.vmxon(&vmxon_env { cpl: 3, ..env() }, REGION, 4),
+        Err(vmx_exception::GP)
+    );
     // CR0.NE clear (fixed-1 bit)
-    assert_eq!(cpu.vmxon(&vmxon_env { cr0: CR0 & !X86_CR0_NE, ..env() }, REGION, 4), Err(vmx_exception::GP));
+    assert_eq!(
+        cpu.vmxon(
+            &vmxon_env {
+                cr0: CR0 & !X86_CR0_NE,
+                ..env()
+            },
+            REGION,
+            4
+        ),
+        Err(vmx_exception::GP)
+    );
     // CR4 with a fixed-0 bit set
-    assert_eq!(cpu.vmxon(&vmxon_env { cr4: CR4 | (1 << 23), ..env() }, REGION, 4), Err(vmx_exception::GP));
+    assert_eq!(
+        cpu.vmxon(
+            &vmxon_env {
+                cr4: CR4 | (1 << 23),
+                ..env()
+            },
+            REGION,
+            4
+        ),
+        Err(vmx_exception::GP)
+    );
     // IA32_FEATURE_CONTROL: unlocked, or locked but VMXON-outside-SMX clear
-    assert_eq!(cpu.vmxon(&vmxon_env { feature_control: 0x4, ..env() }, REGION, 4), Err(vmx_exception::GP));
-    assert_eq!(cpu.vmxon(&vmxon_env { feature_control: 0x1, ..env() }, REGION, 4), Err(vmx_exception::GP));
+    assert_eq!(
+        cpu.vmxon(
+            &vmxon_env {
+                feature_control: 0x4,
+                ..env()
+            },
+            REGION,
+            4
+        ),
+        Err(vmx_exception::GP)
+    );
+    assert_eq!(
+        cpu.vmxon(
+            &vmxon_env {
+                feature_control: 0x1,
+                ..env()
+            },
+            REGION,
+            4
+        ),
+        Err(vmx_exception::GP)
+    );
     assert!(!cpu.in_vmx);
 }
 
@@ -160,7 +215,11 @@ fn vmxon_gp_cases() {
 fn vmxon_checks_come_in_sdm_order() {
     // CR4.VMXE clear beats everything: #UD even with CPL 3 and a bad pointer.
     let mut cpu = vmx_cpu_state::new();
-    let e = vmxon_env { cr4: 0, cpl: 3, ..env() };
+    let e = vmxon_env {
+        cr4: 0,
+        cpl: 3,
+        ..env()
+    };
     assert_eq!(cpu.vmxon(&e, 0x123, 99), Err(vmx_exception::UD));
     // #GP beats a bad pointer.
     let e = vmxon_env { cpl: 3, ..env() };
@@ -170,9 +229,15 @@ fn vmxon_checks_come_in_sdm_order() {
 #[test]
 fn vmxon_bad_pointer_is_vmfailinvalid() {
     let mut cpu = vmx_cpu_state::new();
-    assert_eq!(cpu.vmxon(&env(), REGION + 0x10, 4), Ok(VmxResult::FailInvalid)); // unaligned
+    assert_eq!(
+        cpu.vmxon(&env(), REGION + 0x10, 4),
+        Ok(VmxResult::FailInvalid)
+    ); // unaligned
     assert_eq!(cpu.vmxon(&env(), 1 << 39, 4), Ok(VmxResult::FailInvalid)); // beyond phys width
-    assert_eq!(cpu.vmxon(&env(), (1 << 39) - 0x1000, 4), Ok(VmxResult::Succeed)); // last page
+    assert_eq!(
+        cpu.vmxon(&env(), (1 << 39) - 0x1000, 4),
+        Ok(VmxResult::Succeed)
+    ); // last page
     let mut cpu = vmx_cpu_state::new();
     // IA32_VMX_BASIC bit 48: pointers must fit in 32 bits
     let mut e = env();
@@ -187,7 +252,10 @@ fn vmxon_wrong_revision_is_vmfailinvalid() {
     let mut cpu = vmx_cpu_state::new();
     assert_eq!(cpu.vmxon(&env(), REGION, 0), Ok(VmxResult::FailInvalid));
     assert_eq!(cpu.vmxon(&env(), REGION, 5), Ok(VmxResult::FailInvalid));
-    assert_eq!(cpu.vmxon(&env(), REGION, 4 | 0x8000_0000), Ok(VmxResult::FailInvalid));
+    assert_eq!(
+        cpu.vmxon(&env(), REGION, 4 | 0x8000_0000),
+        Ok(VmxResult::FailInvalid)
+    );
     assert!(!cpu.in_vmx);
 }
 
@@ -196,7 +264,10 @@ fn double_vmxon_without_current_vmcs_is_vmfailinvalid() {
     let mut cpu = vmx_cpu_state::new();
     cpu.vmxon(&env(), REGION, 4).unwrap();
     assert_eq!(cpu.vmxon(&env(), REGION, 4), Ok(VmxResult::FailInvalid));
-    assert_eq!(cpu.vm_instruction_error, 0, "no VMCS to hold an error number");
+    assert_eq!(
+        cpu.vm_instruction_error, 0,
+        "no VMCS to hold an error number"
+    );
     assert!(cpu.in_vmx);
 }
 
@@ -230,8 +301,17 @@ fn vmxoff_without_vmxon_is_ud() {
 fn vmxoff_ud_without_vmxe_gp_at_cpl3() {
     let mut cpu = vmx_cpu_state::new();
     cpu.vmxon(&env(), REGION, 4).unwrap();
-    assert_eq!(cpu.vmxoff(&vmxon_env { cr4: CR4_NO_VMXE, ..env() }), Err(vmx_exception::UD));
-    assert_eq!(cpu.vmxoff(&vmxon_env { cpl: 3, ..env() }), Err(vmx_exception::GP));
+    assert_eq!(
+        cpu.vmxoff(&vmxon_env {
+            cr4: CR4_NO_VMXE,
+            ..env()
+        }),
+        Err(vmx_exception::UD)
+    );
+    assert_eq!(
+        cpu.vmxoff(&vmxon_env { cpl: 3, ..env() }),
+        Err(vmx_exception::GP)
+    );
     assert!(cpu.in_vmx, "failed VMXOFF must not leave VMX operation");
 }
 

@@ -32,6 +32,9 @@ use crate::{
     vmx_state::*,
 };
 
+// Re-export: s07..s10 use `crate::s06_run::vcpu_vmx` (a glob `use` is private).
+pub(crate) use crate::vmx_run::vcpu_vmx;
+
 // int ktvmx_vcpu_run(struct vcpu_vmx *vcpu /* rdi */, u32 resume /* esi */)
 //   returns 0 after a VM exit (guest GPRs saved into vcpu->regs), 1 if VMLAUNCH/VMRESUME
 //   itself failed (VMfail: CF or ZF set; nothing was entered).

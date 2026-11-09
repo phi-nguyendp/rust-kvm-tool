@@ -21,6 +21,9 @@
 
 use crate::hw::PageBox;
 use crate::vmx_uapi::*;
+// Explicit import wins over both globs: vmx_uapi::{EINVAL, ENOMEM} are plain i32 errnos
+// for the host-testable checks; here we want the kernel's `Error` values.
+use kernel::error::code::{EINVAL, ENOMEM};
 use core::mem::MaybeUninit;
 use kernel::{
     fs::File,
@@ -184,7 +187,7 @@ impl MiscDevice for KtvmxDev {
             }
             _ => {}
         }
-        let vm = guard.as_mut().ok_or(EINVAL)?;
+        let vm = (*guard).as_mut().ok_or(EINVAL)?; // Option::as_mut, not Guard::as_mut (Pin)
         match cmd {
             // single vCPU, already created together with the VM
             KTVMX_CREATE_VCPU => Ok(0),

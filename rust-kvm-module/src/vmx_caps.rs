@@ -16,11 +16,12 @@
 
 use crate::vmcs_ops::MsrOps;
 use crate::vmx::*;
+use crate::vmx_caps::feat_ctl_state::{CanEnable, DisabledByBios, Enabled};
+use crate::vmx_caps::vmx_probe_error::{DisabledByBios as DisabledByBiosErr, MsrMissing, NoVmx};
 
 /// CPUID.1:ECX.VMX[bit 5]. (kernel: `cpu_has_vmx()` in arch/x86/kvm/vmx/vmx.h)
 pub fn cpu_has_vmx(cpuid_1_ecx: u32) -> bool {
-    let _ = (cpuid_1_ecx,);
-    todo!()
+    cpuid_1_ecx & CPUID_1_ECX_VMX != 0
 }
 
 /// What the firmware left in IA32_FEATURE_CONTROL (MSR 0x3a).
@@ -40,14 +41,29 @@ pub enum feat_ctl_state {
 /// (bit 2); the inside-SMX bit (bit 1) is for Intel TXT launches.
 /// (kernel: init_ia32_feat_ctl() in arch/x86/kernel/cpu/feat_ctl.c)
 pub fn vmx_feat_ctl_state(feature_control: u64) -> feat_ctl_state {
-    let _ = (feature_control,);
-    todo!()
+    if feature_control & FEAT_CTL_LOCKED != 0 {
+        if feature_control & FEAT_CTL_VMX_ENABLED_OUTSIDE_SMX == 0 {
+            DisabledByBios
+        } else {
+            Enabled
+        }
+    } else if feature_control & FEAT_CTL_VMX_ENABLED_OUTSIDE_SMX != 0 {
+        // if it is not locked, we would need to lock it
+        CanEnable(feature_control | FEAT_CTL_VMX_ENABLED_OUTSIDE_SMX | FEAT_CTL_LOCKED)
+    } else {
+        CanEnable(feature_control | FEAT_CTL_VMX_ENABLED_OUTSIDE_SMX | FEAT_CTL_LOCKED)
+    }
 }
 
 /// True if the BIOS locked VMX off. (kernel: the "VMX disabled by BIOS" message)
 pub fn vmx_disabled_by_bios(feature_control: u64) -> bool {
-    let _ = (feature_control,);
-    todo!()
+    if (feature_control & FEAT_CTL_LOCKED != 0)
+        && (feature_control & FEAT_CTL_VMX_ENABLED_OUTSIDE_SMX == 0)
+    {
+        true
+    } else {
+        false
+    }
 }
 
 /// Decoded IA32_VMX_BASIC (MSR 0x480). SDM Appendix A.1.
@@ -71,11 +87,23 @@ pub struct vmx_basic {
     pub true_controls: bool,
 }
 
+fn extract_bits(value: u64, hi: u32, lo: u32) -> u32 {
+    // shifted and with the mask
+    ((value >> lo) & ((1u64 << (hi - lo + 1)) - 1)) as u32
+}
+
 /// Decode IA32_VMX_BASIC. (kernel: vmx_basic_vmcs_revision_id(), vmx_basic_vmcs_size(),
 /// vmx_basic_vmcs_mem_type() in arch/x86/include/asm/vmx.h)
 pub fn vmx_basic_decode(raw: u64) -> vmx_basic {
-    let _ = (raw,);
-    todo!()
+    vmx_basic {
+        revision_id: extract_bits(raw, 30, 0),
+        vmcs_size: extract_bits(raw, 44, 32),
+        phys_addr_32bit: extract_bits(raw, 48, 48) == 1,
+        dual_monitor: extract_bits(raw, 49, 49) == 1,
+        memtype: extract_bits(raw, 53, 50) as u8,
+        ins_outs_info: extract_bits(raw, 54, 54) == 1,
+        true_controls: extract_bits(raw, 55, 55) == 1,
+    }
 }
 
 /// Decoded IA32_VMX_EPT_VPID_CAP (MSR 0x48c). SDM Appendix A.10.
@@ -120,8 +148,26 @@ pub struct ept_vpid_cap {
 /// (kernel: cpu_has_vmx_ept_4levels(), cpu_has_vmx_ept_mt_wb(), cpu_has_vmx_invept_*()
 /// ... in arch/x86/kvm/vmx/capabilities.h)
 pub fn vmx_ept_vpid_decode(raw: u64) -> ept_vpid_cap {
-    let _ = (raw,);
-    todo!()
+    let is_set = |bit: u32| -> bool { ((raw >> bit) & 1) != 0 };
+
+    ept_vpid_cap {
+        exec_only: is_set(0),
+        pwl4: is_set(6),
+        uc: is_set(8),
+        wb: is_set(14),
+        large_2m: is_set(16),
+        large_1g: is_set(17),
+        invept: is_set(20),
+        ad: is_set(21),
+        advanced_exit_info: is_set(22),
+        invept_single: is_set(25),
+        invept_all: is_set(26),
+        invvpid: is_set(32),
+        invvpid_addr: is_set(40),
+        invvpid_single: is_set(41),
+        invvpid_all: is_set(42),
+        invvpid_single_nonglobal: is_set(43),
+    }
 }
 
 /// Everything stage 1 learns about the CPU.
@@ -157,6 +203,62 @@ pub enum vmx_probe_error {
 /// say they must exist.
 /// (kernel: init_ia32_feat_ctl, then setup_vmcs_config/hardware_setup)
 pub fn vmx_probe<M: MsrOps>(msrs: &M, cpuid_1_ecx: u32) -> Result<vmx_caps, vmx_probe_error> {
-    let _ = (msrs, cpuid_1_ecx,);
-    todo!()
+    if !cpu_has_vmx(cpuid_1_ecx) {
+        Err(NoVmx)
+    } else {
+        let feate_ctl = match msrs.rdmsr(MSR_IA32_FEATURE_CONTROL) {
+            Some(msr_ia32_fs) => vmx_feat_ctl_state(msr_ia32_fs),
+            None => return Err(MsrMissing(MSR_IA32_FEATURE_CONTROL)),
+        };
+
+        if feate_ctl == DisabledByBios {
+            return Err(DisabledByBiosErr);
+        }
+
+        let vmx_basic_value = match msrs.rdmsr(MSR_IA32_VMX_BASIC) {
+            Some(raw) => vmx_basic_decode(raw),
+            None => {
+                return Err(MsrMissing(MSR_IA32_VMX_BASIC));
+            }
+        };
+
+        let vmx_procbased_ctls = match msrs.rdmsr(MSR_IA32_VMX_PROCBASED_CTLS) {
+            Some(raw) => raw,
+            None => return Err(MsrMissing(MSR_IA32_VMX_PROCBASED_CTLS)),
+        };
+
+        let vmx_procbased_ctls = vmx_procbased_ctls >> 32; // get hight part
+
+        let ept_vpid = if extract_bits(vmx_procbased_ctls, 31, 31) == 1 {
+            let vmx_procbased_ctls2 = match msrs.rdmsr(MSR_IA32_VMX_PROCBASED_CTLS2) {
+                Some(raw) => raw,
+                None => return Err(MsrMissing(MSR_IA32_VMX_PROCBASED_CTLS2)),
+            };
+            let vmx_procbased_ctls2 = vmx_procbased_ctls2 >> 32;
+
+            if extract_bits(vmx_procbased_ctls2, 1, 1) == 1
+                || extract_bits(vmx_procbased_ctls2, 5, 5) == 1
+            {
+                match msrs.rdmsr(MSR_IA32_VMX_EPT_VPID_CAP) {
+                    Some(raw) => Some(vmx_ept_vpid_decode(raw)),
+                    None => return Err(MsrMissing(MSR_IA32_VMX_EPT_VPID_CAP)),
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let feat_ctl_write = match feate_ctl {
+            CanEnable(value) => Some(value),
+            _ => None,
+        };
+
+        Ok(vmx_caps {
+            basic: vmx_basic_value,
+            ept_vpid: ept_vpid,
+            feat_ctl_write: feat_ctl_write,
+        })
+    }
 }

@@ -10,13 +10,9 @@
 
 use core::arch::asm;
 
-use crate::{
-    hw,
-    s01_caps::HwMsrs,
-    vmx::*,
-    vmx_caps::*,
-    vmx_enable::*,
-};
+use crate::hw::PageBox;
+use crate::vmx_enable::VmxResult;
+use crate::{hw, s01_caps::HwMsrs, vmx::*, vmx_caps::*, vmx_enable::*};
 
 /// VMXON with the physical address of an initialised VMXON region.
 /// Return how it ended, decoded with `vmx_fail_kind(rflags)`.
@@ -37,8 +33,12 @@ use crate::{
 /// CR4.VMXE set, CR0/CR4 fixed bits satisfied, the region initialised (stage 2 host
 /// logic), not already in VMX operation on this CPU.
 pub(crate) unsafe fn vmxon(region_phys: u64) -> VmxResult {
-    let _ = region_phys;
-    todo!()
+    let flags: u64;
+    unsafe {
+        asm!("vmxon [{p}]", "pushfq", "pop {f}", p = in(reg) &region_phys,
+        f = out(reg) flags);
+    }
+    vmx_fail_kind(flags)
 }
 
 /// VMXOFF. Same result decoding. (kernel: `kvm_cpu_vmxoff`)
@@ -46,7 +46,12 @@ pub(crate) unsafe fn vmxon(region_phys: u64) -> VmxResult {
 /// # Safety
 /// Must be in VMX operation on this CPU; no VMCS may be left launched and still needed.
 pub(crate) unsafe fn vmxoff() -> VmxResult {
-    todo!()
+    let flags: u64;
+    unsafe {
+        asm!("vmxoff", "pushfq", "pop {f}",
+        f = out(reg) flags);
+    }
+    vmx_fail_kind(flags)
 }
 
 /// The proof that this CPU is in VMX operation. Dropping it leaves VMX operation and
@@ -81,7 +86,52 @@ impl Drop for VmxCpu {
 /// The module does not pin itself to a CPU: run QEMU with `-smp 1`, and think about why
 /// (see the stage doc).
 pub(crate) fn vmx_enable_cpu() -> core::result::Result<VmxCpu, &'static str> {
-    todo!()
+    let (_, _, ecx, _) = hw::cpuid(1, 0);
+    let caps = vmx_probe(&HwMsrs, ecx).map_err(|e| match e {
+        vmx_probe_error::NoVmx => "CPUID.1:ECX.VMX is clear (QEMU needs -cpu host,vmx=on)",
+        vmx_probe_error::DisabledByBios => "IA32_FEATURE_CONTROL locks VMX off",
+        vmx_probe_error::MsrMissing(_) => "a VMX capability MSR is missing",
+    })?;
+    if let Some(v) = caps.feat_ctl_write.as_ref() {
+        hw::wrmsr(MSR_IA32_FEATURE_CONTROL, *v);
+    }
+    let cr_fixed = vmx_read_cr_fixed(&HwMsrs).ok_or("missing Fixed registers")?;
+    let mut vmxon_region = PageBox::new().map_err(|_| "failed to allocate VMXON region")?;
+    vmxon_region_init(vmxon_region.as_mut_slice(), &caps.basic)?;
+    let old_cr4 = hw::read_cr4();
+    let adjusted_cr4 = cr_fixed_adjust(
+        old_cr4 | X86_CR4_VMXE,
+        cr_fixed.cr4_fixed0,
+        cr_fixed.cr4_fixed1,
+    );
+    unsafe {
+        hw::write_cr4(adjusted_cr4);
+    }
+    let cr0 = hw::read_cr0();
+    if !cr_fixed_ok(cr0, cr_fixed.cr0_fixed0, cr_fixed.cr0_fixed1) {
+        unsafe {
+            hw::write_cr4(old_cr4);
+        }
+        return Err("cr0 does not satisfy fixed bits");
+    }
+    match unsafe { vmxon(vmxon_region.phys()) } {
+        VmxResult::Succeed => Ok(VmxCpu {
+            old_cr4: old_cr4,
+            _region: vmxon_region,
+        }),
+        VmxResult::FailInvalid => {
+            unsafe {
+                hw::write_cr4(old_cr4);
+            }
+            Err("vmxon FailInvalid")
+        }
+        VmxResult::FailValid => {
+            unsafe {
+                hw::write_cr4(old_cr4);
+            }
+            Err("vmxon FailValid")
+        }
+    }
 }
 
 /// PROVIDED. Enable, check, disable, check CR4 is back, and do it twice.

@@ -13,4 +13,8 @@ scripts/config -e RUST -d KVM_INTEL -d KVM_AMD -d KVM_HYPERV -d DEBUG_INFO_BTF -
 make LLVM=1 olddefconfig
 grep -E "^CONFIG_RUST=y" .config || { echo "CONFIG_RUST did not stick: run make LLVM=1 menuconfig (General setup > Rust support)"; exit 1; }
 make LLVM=1 -j"$(nproc)" bzImage rust/ modules_prepare
+# External modules link against Module.symvers, which only `make modules` writes.
+# ktvmx needs vmlinux exports only, so seed it from vmlinux.symvers (else modpost
+# reports every kernel symbol, even call_printk, as undefined).
+[ -f Module.symvers ] || cp vmlinux.symvers Module.symvers
 echo "kernel ready: $DST/arch/x86/boot/bzImage"
