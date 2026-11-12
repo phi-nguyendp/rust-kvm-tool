@@ -87,7 +87,7 @@ pub struct vmx_basic {
     pub true_controls: bool,
 }
 
-fn extract_bits(value: u64, hi: u32, lo: u32) -> u32 {
+pub fn extract_bits(value: u64, hi: u32, lo: u32) -> u32 {
     // shifted and with the mask
     ((value >> lo) & ((1u64 << (hi - lo + 1)) - 1)) as u32
 }

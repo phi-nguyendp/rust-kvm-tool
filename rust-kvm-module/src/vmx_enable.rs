@@ -13,8 +13,6 @@
 //! SDM rules for #UD / #GP / VMfailInvalid / VMfailValid can be tested without a CPU.
 #![allow(non_camel_case_types)]
 
-use core::iter::Successors;
-
 use crate::vmcs_ops::MsrOps;
 use crate::vmx::*;
 use crate::vmx_caps::{feat_ctl_state, vmx_basic, vmx_feat_ctl_state};
