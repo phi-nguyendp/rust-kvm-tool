@@ -176,7 +176,10 @@ pub(crate) fn host_take_interrupt() {
 /// `run`: `with_irqs_off(|| vmx_vcpu_enter(..))`, `vmx_post_run`, `host_take_interrupt()` on
 /// EXTERNAL_INTERRUPT, return the raw `VM_EXIT_REASON` with IRQs enabled again.
 impl vcpu_vmx {
-    pub(crate) fn new_flat32(_entry_phys: u64, _rsp: u64) -> core::result::Result<Self, &'static str> {
+    pub(crate) fn new_flat32(
+        _entry_phys: u64,
+        _rsp: u64,
+    ) -> core::result::Result<Self, &'static str> {
         todo!("stage 6 task 5: see the doc comment")
     }
 
@@ -202,6 +205,7 @@ pub(crate) fn selftest() -> core::result::Result<(), &'static str> {
         | SECONDARY_EXEC_UNRESTRICTED_GUEST
         | SECONDARY_EXEC_ENABLE_VPID);
     cfg.pin_based_exec_ctrl &= !PIN_BASED_VMX_PREEMPTION_TIMER;
+    cfg.vmexit_ctrl &= !VM_EXIT_SAVE_VMX_PREEMPTION_TIMER;
     let mut v = HwVmcs;
     vmx_vmcs_controls_write(&mut v, &cfg);
 
@@ -240,14 +244,25 @@ pub(crate) fn selftest() -> core::result::Result<(), &'static str> {
     match action {
         vmx_run_action::Exit(EXIT_REASON_HLT) => {}
         vmx_run_action::Exit(b) => {
-            pr_err!("ktvmx: unexpected exit {} ({})\n", b, vmx_exit_reason_str(b));
+            pr_err!(
+                "ktvmx: unexpected exit {} ({})\n",
+                b,
+                vmx_exit_reason_str(b)
+            );
             return Err("guest did not exit with HLT");
         }
         vmx_run_action::EntryFailed(vmx_entry_failure::InstructionError(e)) => {
-            pr_err!("ktvmx: VM entry failed: VM-instruction error {}: {}\n", e, vmx_instruction_error_str(e));
+            pr_err!(
+                "ktvmx: VM entry failed: VM-instruction error {}: {}\n",
+                e,
+                vmx_instruction_error_str(e)
+            );
             return Err("VMLAUNCH failed (see dmesg)");
         }
-        vmx_run_action::EntryFailed(vmx_entry_failure::ExitFailed { basic, qualification }) => {
+        vmx_run_action::EntryFailed(vmx_entry_failure::ExitFailed {
+            basic,
+            qualification,
+        }) => {
             pr_err!(
                 "ktvmx: VM entry failed after start: {} qualification {:#x}\n",
                 vmx_exit_reason_str(basic),
