@@ -11,12 +11,7 @@ use core::arch::asm;
 use kernel::prelude::*;
 
 use crate::{
-    hw,
-    s02_vmxon::vmx_enable_cpu,
-    vmcs_fields::*,
-    vmcs_ops::VmcsOps,
-    vmx::*,
-    vmx_caps::*,
+    hw, s02_vmxon::vmx_enable_cpu, vmcs_fields::*, vmcs_ops::VmcsOps, vmx::*, vmx_caps::*,
     vmx_enable::*,
 };
 
@@ -27,8 +22,13 @@ use crate::{
 /// # Safety
 /// In VMX operation (a `VmxCpu` is alive); `vmcs_phys` is a valid VMCS region address.
 pub(crate) unsafe fn vmclear(vmcs_phys: u64) -> VmxResult {
-    let _ = vmcs_phys;
-    todo!()
+    let flag: u64;
+
+    unsafe {
+        asm!("vmclear [{p}]", "pushfq", "pop {f}", p = in(reg)&vmcs_phys,
+        f = out(reg) flag);
+    }
+    vmx_fail_kind(flag)
 }
 
 /// VMPTRLD: make the VMCS at `vmcs_phys` the *current* VMCS of this CPU.
@@ -36,8 +36,13 @@ pub(crate) unsafe fn vmclear(vmcs_phys: u64) -> VmxResult {
 /// # Safety
 /// As `vmclear`; also its first dword must hold the revision id (`vmcs_region_init`).
 pub(crate) unsafe fn vmptrld(vmcs_phys: u64) -> VmxResult {
-    let _ = vmcs_phys;
-    todo!()
+    let flag: u64;
+
+    unsafe {
+        asm!("vmptrld [{p}]", "pushfq", "pop {f}", p = in(reg)&vmcs_phys,
+            f = out(reg)flag);
+    }
+    vmx_fail_kind(flag)
 }
 
 /// VMREAD of the current VMCS. `Err(result)` is VMfailInvalid/VMfailValid (no current
@@ -47,8 +52,19 @@ pub(crate) unsafe fn vmptrld(vmcs_phys: u64) -> VmxResult {
 /// # Safety
 /// In VMX operation.
 pub(crate) unsafe fn vmread(field: u32) -> core::result::Result<u64, VmxResult> {
-    let _ = field;
-    todo!()
+    let flag: u64;
+    let vmcs_phys: u64;
+
+    unsafe {
+        asm!("vmread {val}, {field}",
+            "pushfq",
+            "pop {f}", val = out(reg)vmcs_phys, field = in(reg)field, f = out(reg)flag);
+    }
+    if vmx_fail_kind(flag) != VmxResult::Succeed {
+        Err(vmx_fail_kind(flag))
+    } else {
+        Ok(vmcs_phys)
+    }
 }
 
 /// VMWRITE to the current VMCS. Intel syntax: `vmwrite {field}, {value}` (field first).
@@ -56,8 +72,15 @@ pub(crate) unsafe fn vmread(field: u32) -> core::result::Result<u64, VmxResult> 
 /// # Safety
 /// In VMX operation.
 pub(crate) unsafe fn vmwrite(field: u32, value: u64) -> VmxResult {
-    let _ = (field, value);
-    todo!()
+    let flag: u64;
+    unsafe {
+        asm!("vmwrite {field}, {value}",
+            "pushfq", "pop {f}",
+            field = in(reg)field,
+            value = in(reg)value,
+            f = out(reg)flag);
+    }
+    vmx_fail_kind(flag)
 }
 
 /// PROVIDED. `VmcsOps` on the real current VMCS, so every stage that is generic over
@@ -81,7 +104,12 @@ impl VmcsOps for HwVmcs {
         // SAFETY: as above.
         let r = unsafe { vmwrite(field, value) };
         if r != VmxResult::Succeed {
-            pr_err!("ktvmx: vmwrite({:#x}, {:#x}) failed: {:?}\n", field, value, r);
+            pr_err!(
+                "ktvmx: vmwrite({:#x}, {:#x}) failed: {:?}\n",
+                field,
+                value,
+                r
+            );
         }
     }
 }
@@ -128,7 +156,9 @@ pub(crate) fn selftest() -> core::result::Result<(), &'static str> {
     unsafe {
         match vmwrite(VM_EXIT_REASON, 0) {
             VmxResult::FailValid => {
-                if vmread(VM_INSTRUCTION_ERROR) != Ok(VMXERR_VMWRITE_READ_ONLY_VMCS_COMPONENT as u64) {
+                if vmread(VM_INSTRUCTION_ERROR)
+                    != Ok(VMXERR_VMWRITE_READ_ONLY_VMCS_COMPONENT as u64)
+                {
                     return Err("VMfailValid, but VM-instruction error is not 13");
                 }
             }
