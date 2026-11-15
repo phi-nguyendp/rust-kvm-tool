@@ -9,6 +9,8 @@
 
 use crate::vmcs_ops::*;
 use crate::vmx::*;
+use crate::vmx_run::vmx_entry_failure::InstructionError;
+use crate::vmx_run::vmx_run_action::HostInterrupt;
 
 // Guest general-purpose registers, in the kernel's order (arch/x86/kvm/kvm_cache_regs.h
 // VCPU_REGS_*). This is *also* the layout of `vcpu_vmx::regs`, which the assembly indexes:
@@ -41,12 +43,12 @@ pub struct vmx_exit_reason(pub u32);
 impl vmx_exit_reason {
     /// Bits 15:0: the basic exit reason (`EXIT_REASON_*`).
     pub fn basic(self) -> u32 {
-        todo!()
+        self.0 & 0xffff
     }
     /// Bit 31: the "exit" is really a failed VM entry (guest state or MSR-load check failed
     /// after the CPU started the entry). Kernel: `vmx_exit_reason.failed_vmentry`.
     pub fn failed_vmentry(self) -> bool {
-        todo!()
+        (self.0 & (1 << 31)) != 0
     }
 }
 
@@ -118,40 +120,95 @@ pub const VMX_EXIT_REASONS: &[(u32, &str)] = &[
 /// Name of a *basic* exit reason, or `"UNKNOWN"` (kernel: the `__print_symbolic` of
 /// VMX_EXIT_REASONS in trace events). Look it up in `VMX_EXIT_REASONS`.
 pub fn vmx_exit_reason_str(basic: u32) -> &'static str {
-    todo!()
+    for e in VMX_EXIT_REASONS {
+        if e.0 == vmx_exit_reason(basic).basic() {
+            return e.1;
+        }
+    }
+
+    "UNKNOWN"
 }
 
 /// (VM-instruction error number, SDM Table 30-1 text). PROVIDED; the numbers are the kernel's
 /// `VMXERR_*` from asm/vmx.h.
 pub const VMX_INSTRUCTION_ERRORS: &[(u32, &str)] = &[
-    (VMXERR_VMCALL_IN_VMX_ROOT_OPERATION, "VMCALL executed in VMX root operation"),
-    (VMXERR_VMCLEAR_INVALID_ADDRESS, "VMCLEAR with invalid physical address"),
+    (
+        VMXERR_VMCALL_IN_VMX_ROOT_OPERATION,
+        "VMCALL executed in VMX root operation",
+    ),
+    (
+        VMXERR_VMCLEAR_INVALID_ADDRESS,
+        "VMCLEAR with invalid physical address",
+    ),
     (VMXERR_VMCLEAR_VMXON_POINTER, "VMCLEAR with VMXON pointer"),
-    (VMXERR_VMLAUNCH_NONCLEAR_VMCS, "VMLAUNCH with non-clear VMCS"),
-    (VMXERR_VMRESUME_NONLAUNCHED_VMCS, "VMRESUME with non-launched VMCS"),
+    (
+        VMXERR_VMLAUNCH_NONCLEAR_VMCS,
+        "VMLAUNCH with non-clear VMCS",
+    ),
+    (
+        VMXERR_VMRESUME_NONLAUNCHED_VMCS,
+        "VMRESUME with non-launched VMCS",
+    ),
     (VMXERR_VMRESUME_AFTER_VMXOFF, "VMRESUME after VMXOFF"),
-    (VMXERR_ENTRY_INVALID_CONTROL_FIELD, "VM entry with invalid control field(s)"),
-    (VMXERR_ENTRY_INVALID_HOST_STATE_FIELD, "VM entry with invalid host-state field(s)"),
-    (VMXERR_VMPTRLD_INVALID_ADDRESS, "VMPTRLD with invalid physical address"),
+    (
+        VMXERR_ENTRY_INVALID_CONTROL_FIELD,
+        "VM entry with invalid control field(s)",
+    ),
+    (
+        VMXERR_ENTRY_INVALID_HOST_STATE_FIELD,
+        "VM entry with invalid host-state field(s)",
+    ),
+    (
+        VMXERR_VMPTRLD_INVALID_ADDRESS,
+        "VMPTRLD with invalid physical address",
+    ),
     (VMXERR_VMPTRLD_VMXON_POINTER, "VMPTRLD with VMXON pointer"),
-    (VMXERR_VMPTRLD_INCORRECT_VMCS_REVISION_ID, "VMPTRLD with incorrect VMCS revision identifier"),
-    (VMXERR_UNSUPPORTED_VMCS_COMPONENT, "VMREAD/VMWRITE from/to unsupported VMCS component"),
-    (VMXERR_VMWRITE_READ_ONLY_VMCS_COMPONENT, "VMWRITE to read-only VMCS component"),
-    (VMXERR_VMXON_IN_VMX_ROOT_OPERATION, "VMXON executed in VMX root operation"),
-    (VMXERR_ENTRY_EVENTS_BLOCKED_BY_MOV_SS, "VM entry with events blocked by MOV SS"),
-    (VMXERR_INVALID_OPERAND_TO_INVEPT_INVVPID, "Invalid operand to INVEPT/INVVPID"),
+    (
+        VMXERR_VMPTRLD_INCORRECT_VMCS_REVISION_ID,
+        "VMPTRLD with incorrect VMCS revision identifier",
+    ),
+    (
+        VMXERR_UNSUPPORTED_VMCS_COMPONENT,
+        "VMREAD/VMWRITE from/to unsupported VMCS component",
+    ),
+    (
+        VMXERR_VMWRITE_READ_ONLY_VMCS_COMPONENT,
+        "VMWRITE to read-only VMCS component",
+    ),
+    (
+        VMXERR_VMXON_IN_VMX_ROOT_OPERATION,
+        "VMXON executed in VMX root operation",
+    ),
+    (
+        VMXERR_ENTRY_EVENTS_BLOCKED_BY_MOV_SS,
+        "VM entry with events blocked by MOV SS",
+    ),
+    (
+        VMXERR_INVALID_OPERAND_TO_INVEPT_INVVPID,
+        "Invalid operand to INVEPT/INVVPID",
+    ),
 ];
 
 /// Text of a VM-instruction error number, `"unknown VM-instruction error"` if not in the table.
 pub fn vmx_instruction_error_str(err: u32) -> &'static str {
-    todo!()
+    for e in VMX_INSTRUCTION_ERRORS {
+        if e.0 == err {
+            return e.1;
+        }
+    }
+    "unknown VM-instruction error"
 }
 
 /// Flags for the next entry. VMLAUNCH only works on a *clear* VMCS and VMRESUME only on a
 /// *launched* one (SDM 30.3, errors 4 and 5), so: `VMX_RUN_VMRESUME` iff `vcpu.launched`
 /// (kernel: `__vmx_vcpu_run_flags()`).
 pub fn vmx_vcpu_run_flags(vcpu: &vcpu_vmx) -> u32 {
-    todo!()
+    let mut flags = 0;
+    if vcpu.launched {
+        flags |= VMX_RUN_VMRESUME;
+    }
+
+    flags
 }
 
 /// Bookkeeping right after VMLAUNCH/VMRESUME returned to the host (kernel: the tail of
@@ -160,7 +217,12 @@ pub fn vmx_vcpu_run_flags(vcpu: &vcpu_vmx) -> u32 {
 ///   meaningless (reset it to default) and `launched` must NOT change;
 /// - otherwise `launched = true` and `exit_reason` = `VM_EXIT_REASON` of the current VMCS.
 pub fn vmx_post_run(vcpu: &mut vcpu_vmx, vmcs: &impl VmcsOps) {
-    todo!()
+    if vcpu.fail {
+        vcpu.exit_reason = Default::default();
+    } else {
+        vcpu.launched = true;
+        vcpu.exit_reason = vmx_exit_reason(vmcs.vmcs_read32(VM_EXIT_REASON));
+    }
 }
 
 /// Why VM entry did not enter the guest.
@@ -180,7 +242,15 @@ pub enum vmx_entry_failure {
 /// `vcpu.fail` -> `InstructionError(VM_INSTRUCTION_ERROR)`; else if
 /// `vcpu.exit_reason.failed_vmentry()` -> `ExitFailed` with `EXIT_QUALIFICATION`.
 pub fn vm_entry_failure(vcpu: &vcpu_vmx, vmcs: &impl VmcsOps) -> Option<vmx_entry_failure> {
-    todo!()
+    if vcpu.fail {
+        return Some(InstructionError(vmcs.vmcs_read32(VM_INSTRUCTION_ERROR)));
+    } else if vcpu.exit_reason.failed_vmentry() {
+        return Some(vmx_entry_failure::ExitFailed {
+            basic: vcpu.exit_reason.basic(),
+            qualification: vmcs.vmcs_read64(EXIT_QUALIFICATION),
+        });
+    }
+    None
 }
 
 /// What the run loop does after one entry attempt.
@@ -200,7 +270,14 @@ pub enum vmx_run_action {
 /// entry failure first (`vm_entry_failure`), then `EXIT_REASON_EXTERNAL_INTERRUPT` ->
 /// `HostInterrupt`, everything else `Exit(basic)`.
 pub fn vmx_vcpu_run_decide(vcpu: &vcpu_vmx, vmcs: &impl VmcsOps) -> vmx_run_action {
-    todo!()
+    if let Some(failure) = vm_entry_failure(vcpu, vmcs) {
+        return vmx_run_action::EntryFailed(failure);
+    }
+
+    match vcpu.exit_reason.basic() {
+        EXIT_REASON_EXTERNAL_INTERRUPT => vmx_run_action::HostInterrupt,
+        basic => vmx_run_action::Exit(basic),
+    }
 }
 
 /// The loop around the hardware (kernel: `vcpu_enter_guest()` calling `vmx_vcpu_run()`, then
@@ -214,5 +291,16 @@ pub fn vmx_run_vcpu<V: VmcsOps>(
     enter: &mut dyn FnMut(&mut vcpu_vmx, &mut V, u32),
     host_irq: &mut dyn FnMut(),
 ) -> vmx_run_action {
-    todo!()
+    vcpu.fail = false; // reset for the next entry attempt
+    loop {
+        let flags = vmx_vcpu_run_flags(vcpu);
+        enter(vcpu, vmcs, flags);
+        vmx_post_run(vcpu, vmcs);
+        let action = vmx_vcpu_run_decide(vcpu, vmcs);
+        if action == HostInterrupt {
+            host_irq();
+        } else {
+            return action;
+        }
+    }
 }
