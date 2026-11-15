@@ -10,6 +10,7 @@
 #   SSH_KEY  private key for root@guest       (default: DISK with .img -> .id_rsa)
 #   PORT     host port forwarded to guest :22 (default 10021)
 #   MEM      guest memory                     (default 2G)
+#   APPEND_EXTRA  extra guest kernel command line (see local.env.example)
 #   KEEP=1   leave the VM running afterwards
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -25,6 +26,7 @@ DISK=${DISK:-$(first_existing \
 SSH_KEY=${SSH_KEY:-${DISK%.img}.id_rsa}
 PORT=${PORT:-10021}
 MEM=${MEM:-2G}
+APPEND_EXTRA=${APPEND_EXTRA:-}
 
 SSH_OPTS=(-i "$SSH_KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
           -o LogLevel=ERROR -o ConnectTimeout=2)
@@ -52,7 +54,7 @@ boot_vm() {
         -drive file="$DISK",format=raw,if=virtio -snapshot \
         -netdev user,id=net0,hostfwd=tcp:127.0.0.1:$PORT-:22 -device virtio-net-pci,netdev=net0 \
         -pidfile "$HERE/qemu.pid" \
-        -append "root=/dev/vda console=ttyS0 net.ifnames=0 panic=-1 oops=panic" \
+        -append "root=/dev/vda console=ttyS0 net.ifnames=0 panic=-1 oops=panic $APPEND_EXTRA" \
         >"$HERE/qemu.log" 2>&1 &
     QEMU=$!
     trap stop_vm EXIT
