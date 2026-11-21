@@ -175,16 +175,134 @@ pub(crate) fn host_take_interrupt() {
 /// owns the `vcpu_vmx`).
 /// `run`: `with_irqs_off(|| vmx_vcpu_enter(..))`, `vmx_post_run`, `host_take_interrupt()` on
 /// EXTERNAL_INTERRUPT, return the raw `VM_EXIT_REASON` with IRQs enabled again.
-impl vcpu_vmx {
-    pub(crate) fn new_flat32(
-        _entry_phys: u64,
-        _rsp: u64,
-    ) -> core::result::Result<Self, &'static str> {
-        todo!("stage 6 task 5: see the doc comment")
-    }
+///
+/// DEVIATION from the doc above (and from the s07 header): the guest is **64-bit with an
+/// identity map**, not flat-32 with paging off. Without EPT there is no unrestricted guest,
+/// so CR0.PG must be 1 (SDM 26.3.1.1: PE/PG fixed to 1 unless "unrestricted guest");
+/// a paging-off guest fails VM entry. The stage-7 guest bytes (mov r32,imm32 / cpuid /
+/// mov r32,r32 / out dx,al / hlt) encode identically in 64-bit mode, so it runs unchanged.
+///
+/// `vcpu_vmx` lives in `src/` (no_std, shared with host tests) and cannot own kernel
+/// resources, so `new_flat32` returns `ktvmx_vcpu`: the `vcpu_vmx` plus everything that
+/// must outlive it. It derefs to `vcpu_vmx`, so `vmx.regs[..]` keeps working. (Kernel
+/// analogue: `struct vcpu_vmx` owning its `loaded_vmcs`; here the nesting is inverted.)
+pub(crate) struct ktvmx_vcpu {
+    vcpu: vcpu_vmx,
+    // Guest page tables: GUEST_CR3 points at `_pml4`, so they must live as long as the VMCS.
+    _pml4: hw::PageBox,
+    _pdpt: hw::PageBox,
+    _pd: hw::PageBox,
+    _pt: hw::PageBox,
+    // Dropped last (fields drop in declaration order): VMCLEAR, then VMXOFF.
+    _lv: LoadedVmcs,
+}
 
+impl core::ops::Deref for ktvmx_vcpu {
+    type Target = vcpu_vmx;
+    fn deref(&self) -> &vcpu_vmx {
+        &self.vcpu
+    }
+}
+
+impl core::ops::DerefMut for ktvmx_vcpu {
+    fn deref_mut(&mut self) -> &mut vcpu_vmx {
+        &mut self.vcpu
+    }
+}
+
+/// What `ktvmx_vcpu::run` returns when VMLAUNCH/VMRESUME itself VMfailed: there is no exit
+/// reason then (`VM_EXIT_REASON` in the VMCS is stale, from the previous exit), so callers
+/// must NOT hand this to `vmx_handle_exit`. Bit 31 set, basic reason 0xffff (no such exit).
+pub(crate) const KTVMX_EXIT_VMFAIL: u32 = VMX_EXIT_REASONS_FAILED_VMENTRY | 0xffff;
+
+impl vcpu_vmx {
+    /// VMXON + a current VMCS + a 64-bit guest at RIP = `entry_phys`, RSP = `rsp`, whose
+    /// page tables identity-map (linear == host physical) the page holding `entry_phys` and
+    /// the page just below `rsp`. Both must be in the same 2 MiB region (one page table).
+    pub(crate) fn new_flat32(
+        entry_phys: u64,
+        rsp: u64,
+    ) -> core::result::Result<ktvmx_vcpu, &'static str> {
+        let code_page = entry_phys & !0xfff;
+        let stack_page = rsp.wrapping_sub(1) & !0xfff;
+        if code_page >> 21 != stack_page >> 21 {
+            return Err("new_flat32: code and stack must be in the same 2 MiB region");
+        }
+
+        let lv = LoadedVmcs::new()?;
+        let mut cfg = lv.cfg;
+        // Same control trimming as the selftest (see there for why).
+        cfg.cpu_based_2nd_exec_ctrl &= !(SECONDARY_EXEC_ENABLE_EPT
+            | SECONDARY_EXEC_UNRESTRICTED_GUEST
+            | SECONDARY_EXEC_ENABLE_VPID);
+        cfg.pin_based_exec_ctrl &= !PIN_BASED_VMX_PREEMPTION_TIMER;
+        cfg.vmexit_ctrl &= !VM_EXIT_SAVE_VMX_PREEMPTION_TIMER;
+        // HLT and unconditional-I/O exiting are in MIN_CPU_BASED; no MSR bitmap, so every
+        // RDMSR/WRMSR exits; CPUID always exits.
+        let mut v = HwVmcs;
+        vmx_vmcs_controls_write(&mut v, &cfg);
+
+        let mut pml4 = hw::PageBox::new().map_err(|_| "alloc")?;
+        let mut pdpt = hw::PageBox::new().map_err(|_| "alloc")?;
+        let mut pd = hw::PageBox::new().map_err(|_| "alloc")?;
+        let mut pt = hw::PageBox::new().map_err(|_| "alloc")?;
+        const P_RW: u64 = 0x3; // present | writable
+        set_pte(&mut pml4, (code_page >> 39) & 511, pdpt.phys() | P_RW);
+        set_pte(&mut pdpt, (code_page >> 30) & 511, pd.phys() | P_RW);
+        set_pte(&mut pd, (code_page >> 21) & 511, pt.phys() | P_RW);
+        set_pte(&mut pt, (code_page >> 12) & 511, code_page | P_RW);
+        set_pte(&mut pt, (stack_page >> 12) & 511, stack_page | P_RW);
+
+        vmx_setup_guest_long_mode(&mut v, entry_phys, rsp, pml4.phys());
+        let hs = read_host_state(); // rsp/rip: written by the assembly at each entry
+        vmx_set_host_state(&mut v, &hs);
+        vmx_check_guest_state(&v, &cfg).map_err(|e| {
+            pr_err!("ktvmx: guest state check: {}\n", e);
+            "guest state rejected by vmx_check_guest_state"
+        })?;
+
+        Ok(ktvmx_vcpu {
+            vcpu: vcpu_vmx::default(),
+            _pml4: pml4,
+            _pdpt: pdpt,
+            _pd: pd,
+            _pt: pt,
+            _lv: lv,
+        })
+    }
+}
+
+impl ktvmx_vcpu {
+    /// Enter the guest until the next exit the caller must see. Host interrupts are taken
+    /// inside (`vmx_run_vcpu` + `host_take_interrupt`, IRQs off around each entry) and IRQs
+    /// are on again on return. Returns the raw `VM_EXIT_REASON` (bit 31 set for a failed
+    /// entry that exited), or `KTVMX_EXIT_VMFAIL` if the instruction itself VMfailed.
     pub(crate) fn run(&mut self) -> u32 {
-        todo!("stage 6 task 5: see the doc comment")
+        let mut v = HwVmcs;
+        let vcpu = &mut self.vcpu;
+        let action = with_irqs_off(|| {
+            vmx_run_vcpu(
+                vcpu,
+                &mut v,
+                // SAFETY: `self._lv` keeps VMX on and this VMCS current (-smp 1: no other
+                // CPU, and no other VMCS is loaded while a ktvmx_vcpu exists); the VMCS was
+                // completed by `new_flat32`; IRQs are off (with_irqs_off).
+                &mut |c, _v, flags| c.fail = unsafe { vmx_vcpu_enter(c, flags) },
+                &mut host_take_interrupt,
+            )
+        });
+        match action {
+            vmx_run_action::EntryFailed(vmx_entry_failure::InstructionError(e)) => {
+                pr_err!(
+                    "ktvmx: VM entry failed: VM-instruction error {}: {}\n",
+                    e,
+                    vmx_instruction_error_str(e)
+                );
+                KTVMX_EXIT_VMFAIL
+            }
+            // Exit / ExitFailed (never HostInterrupt: vmx_run_vcpu loops on it).
+            _ => v.vmcs_read32(VM_EXIT_REASON),
+        }
     }
 }
 

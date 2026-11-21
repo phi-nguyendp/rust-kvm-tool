@@ -18,10 +18,12 @@
 
 use kernel::prelude::*;
 
+// Adapted to the real stage-6 interface: `new_flat32` returns `ktvmx_vcpu` (owns the VMCS,
+// derefs to `vcpu_vmx`) and builds a 64-bit identity-mapped guest, see s06_run.rs.
 use crate::{
     hw,
     s03_vmcs::HwVmcs,
-    s06_run::vcpu_vmx,
+    s06_run::{ktvmx_vcpu, vcpu_vmx, KTVMX_EXIT_VMFAIL},
     vmx::*,
     vmx_exit::*,
 };
@@ -40,10 +42,37 @@ pub(crate) fn host_cpuid(leaf: u32, subleaf: u32) -> [u32; 4] {
 /// `Resume` -> next iteration; `Halt` -> `Ok(())`; anything else -> `Err` (say which exit
 /// reason in the pr_err! so you can debug it).
 /// (kernel: `vcpu_run` loops on `vcpu_enter_guest` while it returns 1.)
-pub(crate) fn run_guest(vmx: &mut vcpu_vmx, uart: &mut uart_com1) -> core::result::Result<(), &'static str> {
+pub(crate) fn run_guest(
+    vmx: &mut ktvmx_vcpu,
+    uart: &mut uart_com1,
+) -> core::result::Result<(), &'static str> {
     const MAX_EXITS: usize = 1000;
-    let _ = (&vmx, &uart, MAX_EXITS);
-    todo!("loop: vmx.run(); vmx_handle_exit(); Resume => continue, Halt => Ok")
+    let mut ctx = exit_ctx { uart, host_cpuid };
+    for _ in 0..MAX_EXITS {
+        // vmx_handle_exit reads VM_EXIT_REASON from the VMCS itself; the raw value
+        // returned by run() is only useful for logging...
+        let raw = vmx.run();
+        // ...except after a VMfail: then the VMCS still holds the *previous* exit reason,
+        // and handling it again would e.g. re-emulate an OUT. run() already logged why.
+        if raw == KTVMX_EXIT_VMFAIL {
+            return Err("VMLAUNCH/VMRESUME failed (see dmesg)");
+        }
+        match vmx_handle_exit(&mut vmx.regs, &mut HwVmcs, &mut ctx) {
+            exit_action::Resume => {}
+            exit_action::Halt => return Ok(()),
+            action => {
+                pr_err!(
+                    "ktvmx: exit {:#x} ({}) -> {:?}\n",
+                    raw,
+                    crate::vmx_run::vmx_exit_reason_str(raw & 0xffff),
+                    action
+                );
+                return Err("unhandled exit_action (see dmesg)");
+            }
+        }
+    }
+    pr_err!("ktvmx: guest did not halt after {} exits\n", MAX_EXITS);
+    Err("guest did not halt")
 }
 
 /// guest/07_exit32.S, assembled by `make -C guest 07_exit32.bin` (33 bytes, position independent).
