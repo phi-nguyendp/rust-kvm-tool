@@ -81,7 +81,10 @@ pub struct uart_com1 {
 impl uart_com1 {
     /// PROVIDED.
     pub const fn new() -> Self {
-        Self { buf: [0; UART_CONSOLE_SIZE], len: 0 }
+        Self {
+            buf: [0; UART_CONSOLE_SIZE],
+            len: 0,
+        }
     }
 
     /// PROVIDED: everything the guest has written to the transmit register so far.
@@ -94,7 +97,12 @@ impl uart_com1 {
     /// full, bytes are dropped. Writes to any other port (including the rest of the
     /// COM1 range) are ignored.
     pub fn pio_write(&mut self, port: u16, size: u8, val: u32) {
-        todo!("append low byte to buf if port == UART_THR and there is room")
+        if port == UART_THR && size == 1 {
+            if self.len < UART_CONSOLE_SIZE {
+                self.buf[self.len] = val as u8;
+                self.len += 1;
+            }
+        }
     }
 
     /// The guest executed `in val, port`. Returns the value, *unmasked*:
@@ -103,7 +111,18 @@ impl uart_com1 {
     /// reads as all ones for `size` bytes (0xff, 0xffff or 0xffff_ffff), like an
     /// unterminated ISA bus.
     pub fn pio_read(&mut self, port: u16, size: u8) -> u32 {
-        todo!("LSR, other COM1 ports, and open-bus all-ones")
+        if port == UART_LSR && size == 1 {
+            UART_LSR_THRE_TEMT
+        } else if port >= UART_COM1_BASE && port <= UART_COM1_LAST {
+            0
+        } else {
+            match size {
+                1 => 0xff,
+                2 => 0xffff,
+                4 => 0xffff_ffff,
+                _ => unreachable!(),
+            }
+        }
     }
 }
 
@@ -119,7 +138,13 @@ impl uart_com1 {
 /// and `vmx_set_interrupt_shadow(vcpu, 0)`.) SDM 27.2.4: the length is only defined for
 /// exits caused by instruction execution.
 pub fn skip_emulated_instruction(vmcs: &mut impl VmcsOps) {
-    todo!("rip += VM_EXIT_INSTRUCTION_LEN; clear STI|MOV_SS in interruptibility")
+    vmcs.vmcs_write64(
+        GUEST_RIP,
+        vmcs.vmcs_read64(GUEST_RIP) + vmcs.vmcs_read64(VM_EXIT_INSTRUCTION_LEN),
+    );
+    let mut intr_state = vmcs.vmcs_read32(GUEST_INTERRUPTIBILITY_INFO);
+    intr_state &= !(GUEST_INTR_STATE_STI | GUEST_INTR_STATE_MOV_SS);
+    vmcs.vmcs_write32(GUEST_INTERRUPTIBILITY_INFO, intr_state);
 }
 
 // ---------------------------------------------------------------------------------
@@ -140,7 +165,24 @@ pub const HYPERV_CPUID_START: u32 = 0x4000_0000;
 /// - every other leaf: whatever `ctx.host_cpuid(leaf, subleaf)` says.
 /// Then `skip_emulated_instruction`, and return `Resume`.
 pub fn handle_cpuid(regs: &mut regs_t, vmcs: &mut impl VmcsOps, ctx: &mut exit_ctx) -> exit_action {
-    todo!("see the doc comment")
+    let leaf = regs[VCPU_REGS_RAX] as u32;
+    let subleaf = regs[VCPU_REGS_RCX] as u32;
+    let mut result = (ctx.host_cpuid)(leaf, subleaf);
+    if leaf == 1 {
+        result[2] |= 1 << 31; // CPUID_1_ECX_HYPERVISOR
+        result[2] &= !(1 << 5); // CPUID_1_ECX_VMX
+    } else if leaf == HYPERV_CPUID_START {
+        result[0] = HYPERV_CPUID_START + 1; // max hypervisor leaf
+        result[1] = u32::from_le_bytes(*b"KtVm"); // EBX
+        result[2] = u32::from_le_bytes(*b"xKtV"); // ECX
+        result[3] = u32::from_le_bytes(*b"mx\0\0"); // EDX
+    }
+    regs[VCPU_REGS_RAX] = result[0] as u64;
+    regs[VCPU_REGS_RBX] = result[1] as u64;
+    regs[VCPU_REGS_RCX] = result[2] as u64;
+    regs[VCPU_REGS_RDX] = result[3] as u64;
+    skip_emulated_instruction(vmcs);
+    exit_action::Resume
 }
 
 // ---------------------------------------------------------------------------------
@@ -168,7 +210,14 @@ pub struct io_exit {
 /// 31:16 = port number. (kernel: `handle_io` uses `exit_qualification & 7`, `& 8`,
 /// `& 16`, `>> 16`.)
 pub fn decode_io_qualification(q: u64) -> io_exit {
-    todo!("pick the fields apart")
+    io_exit {
+        size: ((q & 7) + 1) as u8,
+        is_in: (q & 8) != 0,
+        string: (q & 16) != 0,
+        rep: (q & 32) != 0,
+        imm: (q & 64) != 0,
+        port: ((q >> 16) & 0xffff) as u16,
+    }
 }
 
 /// Handle `EXIT_REASON_IO_INSTRUCTION` against the COM1 model.
@@ -180,7 +229,25 @@ pub fn decode_io_qualification(q: u64) -> io_exit {
 /// - then `skip_emulated_instruction` and return `Resume`.
 /// (kernel: `handle_io` -> `kvm_fast_pio` -> `emulator_pio_in/out`.)
 pub fn handle_io(regs: &mut regs_t, vmcs: &mut impl VmcsOps, ctx: &mut exit_ctx) -> exit_action {
-    todo!("see the doc comment")
+    let q = vmcs.vmcs_read64(EXIT_QUALIFICATION);
+    let io = decode_io_qualification(q);
+    if io.string {
+        return exit_action::ExitToUser(basic_exit_reason(vmcs.vmcs_read32(VM_EXIT_REASON)));
+    }
+    if io.is_in {
+        let val = ctx.uart.pio_read(io.port, io.size);
+        match io.size {
+            1 => regs[VCPU_REGS_RAX] = (regs[VCPU_REGS_RAX] & !0xff) | (val as u64 & 0xff),
+            2 => regs[VCPU_REGS_RAX] = (regs[VCPU_REGS_RAX] & !0xffff) | (val as u64 & 0xffff),
+            4 => regs[VCPU_REGS_RAX] = val as u64,
+            _ => unreachable!(),
+        }
+    } else {
+        let val = regs[VCPU_REGS_RAX] as u32;
+        ctx.uart.pio_write(io.port, io.size, val);
+    }
+    skip_emulated_instruction(vmcs);
+    exit_action::Resume
 }
 
 // ---------------------------------------------------------------------------------
@@ -192,33 +259,97 @@ pub fn handle_io(regs: &mut regs_t, vmcs: &mut impl VmcsOps, ctx: &mut exit_ctx)
 /// IA32_DEBUGCTL, from their `GUEST_*` fields. Everything else (e.g. KERNEL_GS_BASE,
 /// which lives in a separate save area, or any unknown MSR): `None`.
 pub fn vmx_get_msr(vmcs: &impl VmcsOps, msr: u32) -> Option<u64> {
-    todo!("map msr -> GUEST_* field")
+    match msr {
+        MSR_EFER => Some(vmcs.vmcs_read64(GUEST_IA32_EFER)),
+        MSR_IA32_SYSENTER_CS => Some(vmcs.vmcs_read64(GUEST_SYSENTER_CS)),
+        MSR_IA32_SYSENTER_ESP => Some(vmcs.vmcs_read64(GUEST_SYSENTER_ESP)),
+        MSR_IA32_SYSENTER_EIP => Some(vmcs.vmcs_read64(GUEST_SYSENTER_EIP)),
+        MSR_FS_BASE => Some(vmcs.vmcs_read64(GUEST_FS_BASE)),
+        MSR_GS_BASE => Some(vmcs.vmcs_read64(GUEST_GS_BASE)),
+        MSR_IA32_CR_PAT => Some(vmcs.vmcs_read64(GUEST_IA32_PAT)),
+        MSR_IA32_DEBUGCTLMSR => Some(vmcs.vmcs_read64(GUEST_IA32_DEBUGCTL)),
+        _ => None,
+    }
 }
 
 /// Write a guest MSR; the same set as `vmx_get_msr`. Returns false (the caller injects
 /// #GP) for unsupported MSRs, and for EFER values with bits set outside
 /// `EFER_SCE | EFER_LME | EFER_LMA | EFER_NX` (reserved bits, kernel: `kvm_valid_efer`).
 pub fn vmx_set_msr(vmcs: &mut impl VmcsOps, msr: u32, val: u64) -> bool {
-    todo!("inverse of vmx_get_msr, validate EFER")
+    match msr {
+        MSR_EFER => {
+            const EFER_MASK: u64 = EFER_SCE | EFER_LME | EFER_LMA | EFER_NX;
+            if val & !EFER_MASK != 0 {
+                return false;
+            }
+            vmcs.vmcs_write64(GUEST_IA32_EFER, val);
+            true
+        }
+        MSR_IA32_SYSENTER_CS => {
+            vmcs.vmcs_write64(GUEST_SYSENTER_CS, val);
+            true
+        }
+        MSR_IA32_SYSENTER_ESP => {
+            vmcs.vmcs_write64(GUEST_SYSENTER_ESP, val);
+            true
+        }
+        MSR_IA32_SYSENTER_EIP => {
+            vmcs.vmcs_write64(GUEST_SYSENTER_EIP, val);
+            true
+        }
+        MSR_FS_BASE => {
+            vmcs.vmcs_write64(GUEST_FS_BASE, val);
+            true
+        }
+        MSR_GS_BASE => {
+            vmcs.vmcs_write64(GUEST_GS_BASE, val);
+            true
+        }
+        MSR_IA32_CR_PAT => {
+            vmcs.vmcs_write64(GUEST_IA32_PAT, val);
+            true
+        }
+        MSR_IA32_DEBUGCTLMSR => {
+            vmcs.vmcs_write64(GUEST_IA32_DEBUGCTL, val);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// RDMSR: MSR index in ECX; on success EDX:EAX = value (upper halves of RAX/RDX
 /// zeroed), skip the instruction, `Resume`. Unsupported MSR: `InjectGp`, RIP unchanged.
 /// (kernel: `kvm_emulate_rdmsr`.)
 pub fn handle_rdmsr(regs: &mut regs_t, vmcs: &mut impl VmcsOps) -> exit_action {
-    todo!("see the doc comment")
+    let msr = regs[VCPU_REGS_RCX] as u32;
+    if let Some(val) = vmx_get_msr(vmcs, msr) {
+        regs[VCPU_REGS_RAX] = val & 0xffff_ffff;
+        regs[VCPU_REGS_RDX] = val >> 32;
+        skip_emulated_instruction(vmcs);
+        exit_action::Resume
+    } else {
+        exit_action::InjectGp
+    }
 }
 
 /// WRMSR: MSR index in ECX, value in EDX:EAX. Success: skip + `Resume`; unsupported
 /// MSR or invalid value: `InjectGp`, RIP unchanged. (kernel: `kvm_emulate_wrmsr`.)
 pub fn handle_wrmsr(regs: &mut regs_t, vmcs: &mut impl VmcsOps) -> exit_action {
-    todo!("see the doc comment")
+    let msr = regs[VCPU_REGS_RCX] as u32;
+    let val = (regs[VCPU_REGS_RDX] << 32) | (regs[VCPU_REGS_RAX] & 0xffff_ffff);
+    if vmx_set_msr(vmcs, msr, val) {
+        skip_emulated_instruction(vmcs);
+        exit_action::Resume
+    } else {
+        exit_action::InjectGp
+    }
 }
 
 /// HLT: skip it and report `Halt` (a real VMM would block until an interrupt is
 /// pending; ours stops the run loop). (kernel: `kvm_emulate_halt`.)
 pub fn handle_hlt(vmcs: &mut impl VmcsOps) -> exit_action {
-    todo!("skip the instruction, return Halt")
+    skip_emulated_instruction(vmcs);
+    exit_action::Halt
 }
 
 // ---------------------------------------------------------------------------------
@@ -228,7 +359,7 @@ pub fn handle_hlt(vmcs: &mut impl VmcsOps) -> exit_action {
 /// Basic exit reason = `VM_EXIT_REASON` bits 15:0 (SDM 27.2.1; the upper bits hold flags
 /// such as bit 31 "VM-entry failure").
 pub fn basic_exit_reason(reason: u32) -> u32 {
-    todo!("mask")
+    reason & 0xffff
 }
 
 /// The exit dispatcher (kernel: `__vmx_handle_exit` indexing `kvm_vmx_exit_handlers[]`).
@@ -240,6 +371,23 @@ pub fn basic_exit_reason(reason: u32) -> u32 {
 /// - `INTERRUPT_WINDOW`: `Resume` (stage 9 uses it);
 /// - anything else: `ExitToUser(basic reason)`. An unknown exit must never silently
 ///   resume: the guest would just re-execute the same instruction forever.
-pub fn vmx_handle_exit(regs: &mut regs_t, vmcs: &mut impl VmcsOps, ctx: &mut exit_ctx) -> exit_action {
-    todo!("match on the basic reason")
+pub fn vmx_handle_exit(
+    regs: &mut regs_t,
+    vmcs: &mut impl VmcsOps,
+    ctx: &mut exit_ctx,
+) -> exit_action {
+    let reason = vmcs.vmcs_read32(VM_EXIT_REASON);
+    if reason & (1 << 31) != 0 {
+        return exit_action::Fail(reason);
+    }
+    match basic_exit_reason(reason) {
+        EXIT_REASON_CPUID => handle_cpuid(regs, vmcs, ctx),
+        EXIT_REASON_HLT => handle_hlt(vmcs),
+        EXIT_REASON_IO_INSTRUCTION => handle_io(regs, vmcs, ctx),
+        EXIT_REASON_MSR_READ => handle_rdmsr(regs, vmcs),
+        EXIT_REASON_MSR_WRITE => handle_wrmsr(regs, vmcs),
+        EXIT_REASON_EXTERNAL_INTERRUPT => exit_action::Resume,
+        EXIT_REASON_INTERRUPT_WINDOW => exit_action::Resume,
+        _ => exit_action::ExitToUser(basic_exit_reason(reason)),
+    }
 }
