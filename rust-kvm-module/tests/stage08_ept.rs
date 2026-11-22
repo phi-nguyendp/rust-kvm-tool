@@ -46,14 +46,29 @@ impl Ept {
 #[test]
 fn leaf_entry_layout() {
     // R|W|X, write-back, 4 KiB: pa | 6<<3 | 7
-    assert_eq!(ept_entry(0x1234_5000, EPT_PERM_RWX, VMX_EPT_MT_WB, false), 0x1234_5037);
+    assert_eq!(
+        ept_entry(0x1234_5000, EPT_PERM_RWX, VMX_EPT_MT_WB, false),
+        0x1234_5037
+    );
     // large leaf sets bit 7
-    assert_eq!(ept_entry(0x20_0000, EPT_PERM_R | EPT_PERM_W, VMX_EPT_MT_WB, true), 0x20_0000 | 0x80 | 0x30 | 3);
+    assert_eq!(
+        ept_entry(0x20_0000, EPT_PERM_R | EPT_PERM_W, VMX_EPT_MT_WB, true),
+        0x20_0000 | 0x80 | 0x30 | 3
+    );
     // uncached device memory, read-only
-    assert_eq!(ept_entry(0xfee0_0000, EPT_PERM_R, VMX_EPT_MT_UC, false), 0xfee0_0001);
+    assert_eq!(
+        ept_entry(0xfee0_0000, EPT_PERM_R, VMX_EPT_MT_UC, false),
+        0xfee0_0001
+    );
     // junk outside the defined fields is masked away
-    assert_eq!(ept_entry(0xfff0_0000_0000_1fff, 0xff, 0xff, false) & 0xfff0_0000_0000_0fff, 0x3f); // memtype masked to 3 bits
-    assert_eq!(ept_entry(0xfff0_0000_0000_1fff, 0xff, 0xff, false) & EPT_ADDR_MASK, 0x1000);
+    assert_eq!(
+        ept_entry(0xfff0_0000_0000_1fff, 0xff, 0xff, false) & 0xfff0_0000_0000_0fff,
+        0x3f
+    ); // memtype masked to 3 bits
+    assert_eq!(
+        ept_entry(0xfff0_0000_0000_1fff, 0xff, 0xff, false) & EPT_ADDR_MASK,
+        0x1000
+    );
 }
 
 #[test]
@@ -70,7 +85,10 @@ fn eptp_encoding() {
     assert_eq!(construct_eptp(0x1000, false), 0x1000 | 6 | 3 << 3);
     assert_eq!(construct_eptp(0x1000, false), 0x101e);
     assert_eq!(construct_eptp(0x1000, true), 0x105e);
-    assert_eq!(construct_eptp(0x7_fffe_f000, true) & EPT_ADDR_MASK, 0x7_fffe_f000);
+    assert_eq!(
+        construct_eptp(0x7_fffe_f000, true) & EPT_ADDR_MASK,
+        0x7_fffe_f000
+    );
 }
 
 #[test]
@@ -109,8 +127,16 @@ fn misconfig_rules() {
         let e = EPT_PERM_RWX | mt << 3;
         let bad = matches!(mt, 2 | 3 | 7);
         assert_eq!(ept_misconfig_check(e, 1), bad, "PTE memtype {mt}");
-        assert_eq!(ept_misconfig_check(e | VMX_EPT_PAGE_SIZE_BIT, 2), bad, "2M memtype {mt}");
-        assert_eq!(ept_misconfig_check(e | VMX_EPT_PAGE_SIZE_BIT, 3), bad, "1G memtype {mt}");
+        assert_eq!(
+            ept_misconfig_check(e | VMX_EPT_PAGE_SIZE_BIT, 2),
+            bad,
+            "2M memtype {mt}"
+        );
+        assert_eq!(
+            ept_misconfig_check(e | VMX_EPT_PAGE_SIZE_BIT, 3),
+            bad,
+            "1G memtype {mt}"
+        );
     }
     // non-leaf: bits 6:3 reserved
     assert!(ept_misconfig_check(EPT_PERM_RWX | 1 << 3, 4));
@@ -119,14 +145,29 @@ fn misconfig_rules() {
     // level 4 cannot be a leaf: bit 7 reserved
     assert!(ept_misconfig_check(EPT_PERM_RWX | VMX_EPT_PAGE_SIZE_BIT, 4));
     // ...but bit 7 at level 1 is ignored
-    assert!(!ept_misconfig_check(EPT_PERM_RWX | wb | VMX_EPT_PAGE_SIZE_BIT, 1));
+    assert!(!ept_misconfig_check(
+        EPT_PERM_RWX | wb | VMX_EPT_PAGE_SIZE_BIT,
+        1
+    ));
     // large leaves must be aligned
     assert!(ept_misconfig_check(0x20_1000 | EPT_PERM_RWX | wb | 0x80, 2));
-    assert!(!ept_misconfig_check(0x20_0000 | EPT_PERM_RWX | wb | 0x80, 2));
-    assert!(ept_misconfig_check(0x20_0000 | EPT_PERM_RWX | wb | 0x80, 3), "1G leaf at 2M alignment");
-    assert!(!ept_misconfig_check(0x4000_0000 | EPT_PERM_RWX | wb | 0x80, 3));
+    assert!(!ept_misconfig_check(
+        0x20_0000 | EPT_PERM_RWX | wb | 0x80,
+        2
+    ));
+    assert!(
+        ept_misconfig_check(0x20_0000 | EPT_PERM_RWX | wb | 0x80, 3),
+        "1G leaf at 2M alignment"
+    );
+    assert!(!ept_misconfig_check(
+        0x4000_0000 | EPT_PERM_RWX | wb | 0x80,
+        3
+    ));
     // accessed / dirty / ignored high bits are fine
-    assert!(!ept_misconfig_check(DATA | EPT_PERM_RWX | wb | VMX_EPT_ACCESS_BIT | VMX_EPT_DIRTY_BIT, 1));
+    assert!(!ept_misconfig_check(
+        DATA | EPT_PERM_RWX | wb | VMX_EPT_ACCESS_BIT | VMX_EPT_DIRTY_BIT,
+        1
+    ));
 }
 
 #[test]
@@ -142,8 +183,14 @@ fn map_4k_and_translate() {
     assert_eq!(e.tables_used(), 4);
     assert_eq!(e.tr(0x2fff, EPT_PERM_X), Ok(DATA + 0x5fff));
     // the leaf is exactly what ept_entry builds
-    let pt = e.entry(e.entry(e.entry(e.root, 0) & EPT_ADDR_MASK, 0) & EPT_ADDR_MASK, 0) & EPT_ADDR_MASK;
-    assert_eq!(e.entry(pt, 1), ept_entry(DATA, EPT_PERM_RWX, VMX_EPT_MT_WB, false));
+    let pt = e.entry(
+        e.entry(e.entry(e.root, 0) & EPT_ADDR_MASK, 0) & EPT_ADDR_MASK,
+        0,
+    ) & EPT_ADDR_MASK;
+    assert_eq!(
+        e.entry(pt, 1),
+        ept_entry(DATA, EPT_PERM_RWX, VMX_EPT_MT_WB, false)
+    );
 }
 
 #[test]
@@ -159,33 +206,61 @@ fn walk_uses_all_four_levels_for_far_addresses() {
 #[test]
 fn unmapped_addresses_violate() {
     let mut e = Ept::new();
-    assert_eq!(e.tr(0x1000, EPT_PERM_R), Err(EptFault::Violation { level: 4, perms: 0 }));
+    assert_eq!(
+        e.tr(0x1000, EPT_PERM_R),
+        Err(EptFault::Violation { level: 4, perms: 0 })
+    );
     e.map(0x1000, DATA, EPT_PERM_RWX).unwrap();
     // same PT, other slot
-    assert_eq!(e.tr(0x5000, EPT_PERM_R), Err(EptFault::Violation { level: 1, perms: 0 }));
+    assert_eq!(
+        e.tr(0x5000, EPT_PERM_R),
+        Err(EptFault::Violation { level: 1, perms: 0 })
+    );
     // same PD, other PT
-    assert_eq!(e.tr(0x40_0000, EPT_PERM_R), Err(EptFault::Violation { level: 2, perms: 0 }));
+    assert_eq!(
+        e.tr(0x40_0000, EPT_PERM_R),
+        Err(EptFault::Violation { level: 2, perms: 0 })
+    );
     // other PML4 slot
-    assert_eq!(e.tr(1 << 39, EPT_PERM_R), Err(EptFault::Violation { level: 4, perms: 0 }));
+    assert_eq!(
+        e.tr(1 << 39, EPT_PERM_R),
+        Err(EptFault::Violation { level: 4, perms: 0 })
+    );
 }
 
 #[test]
 fn permissions_are_checked() {
     let mut e = Ept::new();
     e.map(0x1000, DATA, EPT_PERM_R).unwrap();
-    e.map(0x2000, DATA + 0x1000, EPT_PERM_R | EPT_PERM_X).unwrap();
+    e.map(0x2000, DATA + 0x1000, EPT_PERM_R | EPT_PERM_X)
+        .unwrap();
     e.map(0x3000, DATA + 0x2000, EPT_PERM_X).unwrap();
     assert_eq!(e.tr(0x1000, EPT_PERM_R), Ok(DATA));
-    assert_eq!(e.tr(0x1000, EPT_PERM_W), Err(EptFault::Violation { level: 1, perms: 1 }));
-    assert_eq!(e.tr(0x1000, EPT_PERM_X), Err(EptFault::Violation { level: 1, perms: 1 }));
+    assert_eq!(
+        e.tr(0x1000, EPT_PERM_W),
+        Err(EptFault::Violation { level: 1, perms: 1 })
+    );
+    assert_eq!(
+        e.tr(0x1000, EPT_PERM_X),
+        Err(EptFault::Violation { level: 1, perms: 1 })
+    );
     assert_eq!(e.tr(0x2000, EPT_PERM_X), Ok(DATA + 0x1000));
-    assert_eq!(e.tr(0x2000, EPT_PERM_W), Err(EptFault::Violation { level: 1, perms: 5 }));
+    assert_eq!(
+        e.tr(0x2000, EPT_PERM_W),
+        Err(EptFault::Violation { level: 1, perms: 5 })
+    );
     // execute-only page: fetch ok, read not
     assert_eq!(e.tr(0x3000, EPT_PERM_X), Ok(DATA + 0x2000));
-    assert_eq!(e.tr(0x3000, EPT_PERM_R), Err(EptFault::Violation { level: 1, perms: 4 }));
+    assert_eq!(
+        e.tr(0x3000, EPT_PERM_R),
+        Err(EptFault::Violation { level: 1, perms: 4 })
+    );
     // a combined access needs all of it
     assert_eq!(e.tr(0x2000, EPT_PERM_R | EPT_PERM_X), Ok(DATA + 0x1000));
-    assert_eq!(e.tr(0x2000, EPT_PERM_R | EPT_PERM_W), Err(EptFault::Violation { level: 1, perms: 5 }));
+    assert_eq!(
+        e.tr(0x2000, EPT_PERM_R | EPT_PERM_W),
+        Err(EptFault::Violation { level: 1, perms: 5 })
+    );
 }
 
 #[test]
@@ -195,9 +270,16 @@ fn effective_permissions_are_the_and_of_every_level() {
     assert_eq!(e.tr(0x1000, EPT_PERM_W), Ok(DATA));
     // take W and X away from the PML4 entry: the RWX leaf is now effectively read-only
     let pdpt = e.entry(e.root, 0) & EPT_ADDR_MASK;
-    e.set_entry(e.root, 0, ept_table_entry(pdpt) & !(EPT_PERM_W | EPT_PERM_X));
+    e.set_entry(
+        e.root,
+        0,
+        ept_table_entry(pdpt) & !(EPT_PERM_W | EPT_PERM_X),
+    );
     assert_eq!(e.tr(0x1000, EPT_PERM_R), Ok(DATA));
-    assert_eq!(e.tr(0x1000, EPT_PERM_W), Err(EptFault::Violation { level: 1, perms: 1 }));
+    assert_eq!(
+        e.tr(0x1000, EPT_PERM_W),
+        Err(EptFault::Violation { level: 1, perms: 1 })
+    );
 }
 
 #[test]
@@ -208,9 +290,15 @@ fn map_2m_pages() {
     assert_eq!(e.tr(0x20_0000, EPT_PERM_R), Ok(0x40_0000));
     assert_eq!(e.tr(0x2f_1234, EPT_PERM_W), Ok(0x4f_1234));
     assert_eq!(e.tr(0x3f_ffff, EPT_PERM_W), Ok(0x5f_ffff));
-    assert_eq!(e.tr(0x40_0000, EPT_PERM_R), Err(EptFault::Violation { level: 2, perms: 0 }));
+    assert_eq!(
+        e.tr(0x40_0000, EPT_PERM_R),
+        Err(EptFault::Violation { level: 2, perms: 0 })
+    );
     let pd = e.entry(e.entry(e.root, 0) & EPT_ADDR_MASK, 0) & EPT_ADDR_MASK;
-    assert_eq!(e.entry(pd, 1), ept_entry(0x40_0000, EPT_PERM_RWX, VMX_EPT_MT_WB, true));
+    assert_eq!(
+        e.entry(pd, 1),
+        ept_entry(0x40_0000, EPT_PERM_RWX, VMX_EPT_MT_WB, true)
+    );
     assert!(!ept_misconfig_check(e.entry(pd, 1), 2));
 }
 
@@ -218,10 +306,20 @@ fn map_2m_pages() {
 fn mixing_page_sizes_is_refused() {
     let mut e = Ept::new();
     e.map_2m(0x20_0000, 0x40_0000, EPT_PERM_RWX).unwrap();
-    assert_eq!(e.map(0x20_1000, DATA, EPT_PERM_RWX), Err(EptError::AlreadyMapped));
+    assert_eq!(
+        e.map(0x20_1000, DATA, EPT_PERM_RWX),
+        Err(EptError::AlreadyMapped)
+    );
     e.map(0x60_0000, DATA, EPT_PERM_RWX).unwrap();
     assert_eq!(
-        ept_map_2m(&mut e.mem, &mut e.alloc, e.root, 0x60_0000, 0x40_0000, EPT_PERM_RWX),
+        ept_map_2m(
+            &mut e.mem,
+            &mut e.alloc,
+            e.root,
+            0x60_0000,
+            0x40_0000,
+            EPT_PERM_RWX
+        ),
         Err(EptError::AlreadyMapped)
     );
     // the 2 MiB mapping is untouched
@@ -243,13 +341,30 @@ fn remapping_overwrites_the_leaf() {
 fn alignment_is_checked() {
     let mut e = Ept::new();
     assert_eq!(e.map(0x1001, DATA, EPT_PERM_RWX), Err(EptError::Misaligned));
-    assert_eq!(e.map(0x1000, DATA + 8, EPT_PERM_RWX), Err(EptError::Misaligned));
     assert_eq!(
-        ept_map_2m(&mut e.mem, &mut e.alloc, e.root, 0x1000, 0x40_0000, EPT_PERM_RWX),
+        e.map(0x1000, DATA + 8, EPT_PERM_RWX),
         Err(EptError::Misaligned)
     );
     assert_eq!(
-        ept_map_2m(&mut e.mem, &mut e.alloc, e.root, 0x20_0000, 0x40_1000, EPT_PERM_RWX),
+        ept_map_2m(
+            &mut e.mem,
+            &mut e.alloc,
+            e.root,
+            0x1000,
+            0x40_0000,
+            EPT_PERM_RWX
+        ),
+        Err(EptError::Misaligned)
+    );
+    assert_eq!(
+        ept_map_2m(
+            &mut e.mem,
+            &mut e.alloc,
+            e.root,
+            0x20_0000,
+            0x40_1000,
+            EPT_PERM_RWX
+        ),
         Err(EptError::Misaligned)
     );
     assert_eq!(e.tables_used(), 1, "a refused mapping allocates nothing");
@@ -275,18 +390,30 @@ fn new_tables_are_zeroed() {
     let root = ept_new_table(&mut mem, &mut alloc).unwrap();
     ept_map_page(&mut mem, &mut alloc, root, 0x1000, DATA, EPT_PERM_RWX).unwrap();
     // PDPT slot 1 must read as "not present", not as stale 0xaa..
-    assert_eq!(ept_translate(&mem, root, 1 << 30, EPT_PERM_R), Err(EptFault::Violation { level: 3, perms: 0 }));
+    assert_eq!(
+        ept_translate(&mem, root, 1 << 30, EPT_PERM_R),
+        Err(EptFault::Violation { level: 3, perms: 0 })
+    );
 }
 
 #[test]
 fn translate_reports_misconfig_and_bad_tables() {
     let mut e = Ept::new();
     e.map(0x1000, DATA, EPT_PERM_RWX).unwrap();
-    let pt = e.entry(e.entry(e.entry(e.root, 0) & EPT_ADDR_MASK, 0) & EPT_ADDR_MASK, 0) & EPT_ADDR_MASK;
+    let pt = e.entry(
+        e.entry(e.entry(e.root, 0) & EPT_ADDR_MASK, 0) & EPT_ADDR_MASK,
+        0,
+    ) & EPT_ADDR_MASK;
     e.set_entry(pt, 1, DATA | EPT_PERM_W); // W without R
-    assert_eq!(e.tr(0x1000, EPT_PERM_R), Err(EptFault::Misconfig { level: 1 }));
+    assert_eq!(
+        e.tr(0x1000, EPT_PERM_R),
+        Err(EptFault::Misconfig { level: 1 })
+    );
     e.set_entry(pt, 1, DATA | EPT_PERM_RWX | 2 << 3); // memtype 2
-    assert_eq!(e.tr(0x1000, EPT_PERM_R), Err(EptFault::Misconfig { level: 1 }));
+    assert_eq!(
+        e.tr(0x1000, EPT_PERM_R),
+        Err(EptFault::Misconfig { level: 1 })
+    );
     // a root outside the memory model
     assert_eq!(
         ept_translate(&e.mem, MEM as u64 + 0x1000, 0x1000, EPT_PERM_R),
@@ -316,7 +443,13 @@ fn violation_qualification_decode() {
 
     assert_eq!(ept_violation_decode(0), ept_violation::default());
     // bits above 8 (user/NX/NMI info) do not disturb the low fields
-    assert_eq!(ept_violation_decode(0x1e00 | 0x2), ept_violation { write: true, ..Default::default() });
+    assert_eq!(
+        ept_violation_decode(0x1e00 | 0x2),
+        ept_violation {
+            write: true,
+            ..Default::default()
+        }
+    );
 }
 
 #[test]

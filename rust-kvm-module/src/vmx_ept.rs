@@ -81,7 +81,10 @@ pub struct BumpAlloc {
 
 impl BumpAlloc {
     pub fn new(start: u64, end: u64) -> Self {
-        Self { next: (start + 0xfff) & !0xfff, end }
+        Self {
+            next: (start + 0xfff) & !0xfff,
+            end,
+        }
     }
 }
 
@@ -102,13 +105,19 @@ impl EptTableAlloc for BumpAlloc {
 
 /// A *leaf* entry mapping `pa` (SDM Tables 28-5 (2 MiB PDE), 28-6 (4 KiB PTE)):
 /// bits 2:0 = `perms` (R/W/X), bits 5:3 = EPT memory type `memtype`
-/// (`VMX_EPT_MT_WB` for RAM, `VMX_EPT_MT_UC` for devices), bit 6 (ignore PAT) left 0, bit 7
+/// (`VMX_EPT_MT_WB` for RAM, `VMX_EPT_MT_UC` for devices), b2it 6 (ignore PAT) left 0, bit 7
 /// = 1 if `large` (a 2 MiB / 1 GiB leaf in a PD / PDPT; for a 4 KiB PTE the bit is
 /// ignored, keep it 0), bits 51:12 = `pa`.
 /// Only the R/W/X bits of `perms` are used (mask it); `pa` is masked with `EPT_ADDR_MASK`.
 /// (kernel: `make_spte` in arch/x86/kvm/mmu/spte.c, for the EPT case.)
 pub fn ept_entry(pa: u64, perms: u64, memtype: u64, large: bool) -> u64 {
-    todo!("perms | memtype << 3 | (large << 7) | (pa & EPT_ADDR_MASK)")
+    // create an ept entry with the given physical address, permissions, memory type, and large
+    // page flag
+    let is_large = if large { 1u64 } else { 0u64 };
+    let perms = perms & EPT_PERM_RWX; // only 3 bits for permissions
+    let memtype = memtype & 0x7; // only 3 bits for memory type
+                                 //0:2 | 3:5 | 6 | 7 | 12:51
+    perms | memtype << 3 | (is_large << 7) | (pa & EPT_ADDR_MASK)
 }
 
 /// A *non-leaf* entry pointing at the next-level table at `table_pa` (Tables 28-1, 28-3,
@@ -116,7 +125,8 @@ pub fn ept_entry(pa: u64, perms: u64, memtype: u64, large: bool) -> u64 {
 /// bit 7 zero (they are reserved in a non-leaf entry), bits 51:12 = `table_pa`.
 /// (kernel: `make_nonleaf_spte`.)
 pub fn ept_table_entry(table_pa: u64) -> u64 {
-    todo!("RWX | table_pa")
+    let ret = EPT_PERM_RWX; // to clear bits 6:3 and 7, we can just start with 0 and set the R/W/X bits
+    ret | (table_pa & EPT_ADDR_MASK)
 }
 
 /// The EPT pointer for the `EPT_POINTER` VMCS field (SDM 24.6.11, Table 25-9):
@@ -125,18 +135,21 @@ pub fn ept_table_entry(table_pa: u64) -> u64 {
 /// flags (`ad`), bits 51:12 = physical address of the PML4 table.
 /// (kernel: `construct_eptp`.)
 pub fn construct_eptp(root_pa: u64, ad: bool) -> u64 {
-    todo!("VMX_EPT_MT_WB | VMX_EPTP_PWL_4 | (ad << 6) | root_pa")
+    let ret = root_pa & EPT_ADDR_MASK;
+    ret | VMX_EPT_MT_WB | VMX_EPTP_PWL_4 | ((ad as u64) << 6)
 }
 
 /// Index into the table of `level` (4 = PML4 ... 1 = PT) for `gpa`: 9 bits starting at bit
 /// `12 + 9 * (level - 1)`.
 pub fn ept_index(gpa: u64, level: u8) -> usize {
-    todo!("shift and mask")
+    let shift = 12 + 9 * (level - 1) as u64;
+    // index of the table at the given level for the given guest physical address
+    ((gpa >> shift) & 0x1ff) as usize
 }
 
 /// An entry is "present" for the CPU if any of R/W/X is set (there is no P bit).
 pub fn ept_present(entry: u64) -> bool {
-    todo!("any of RWX")
+    entry & EPT_PERM_RWX != 0
 }
 
 /// Is `entry`, found in a table of `level` (4..=1), an EPT *misconfiguration*
@@ -152,7 +165,47 @@ pub fn ept_present(entry: u64) -> bool {
 /// (kernel: the checks are in the hardware; `handle_ept_misconfig` reports them via
 /// `kvm_mmu_page_fault`; the spte rules are in `is_shadow_present_pte` etc.)
 pub fn ept_misconfig_check(entry: u64, level: u8) -> bool {
-    todo!("the four rules, in the doc comment")
+    if !ept_present(entry) {
+        return false;
+    }
+
+    let r = entry & EPT_PERM_R != 0;
+    let w = entry & EPT_PERM_W != 0;
+    let x = entry & EPT_PERM_X != 0;
+    let is_leaf = level == 1 || (level == 2 || level == 3) && (entry & (1 << 7) != 0);
+    let is_large_leaf = (level == 2 || level == 3) && (entry & (1 << 7) != 0);
+    let memtype = (entry >> 3) & 0x7;
+    let addr = entry & EPT_ADDR_MASK;
+
+    // Check for W without R
+    if w && !r {
+        return true;
+    }
+    // Check for reserved bits in non-leaf entries
+    if !is_leaf {
+        if (entry & 0x78) != 0 {
+            return true;
+        }
+        if level == 4 && (entry & (1 << 7) != 0) {
+            return true;
+        }
+    }
+    // Check for reserved memory types in leaf entries
+    if is_leaf && (memtype == 2 || memtype == 3 || memtype == 7) {
+        return true;
+    }
+    // Check for misaligned addresses in large leaf entries
+    if is_large_leaf {
+        let page_size = if level == 3 {
+            PAGE_SIZE_1G
+        } else {
+            PAGE_SIZE_2M
+        };
+        if addr & (page_size - 1) != 0 {
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------------
@@ -173,7 +226,10 @@ fn write_entry(mem: &mut impl GuestMem, table: u64, idx: usize, val: u64) -> boo
 }
 
 /// Allocate and zero a table. PROVIDED.
-pub fn ept_new_table(mem: &mut impl GuestMem, alloc: &mut impl EptTableAlloc) -> Result<u64, EptError> {
+pub fn ept_new_table(
+    mem: &mut impl GuestMem,
+    alloc: &mut impl EptTableAlloc,
+) -> Result<u64, EptError> {
     let pa = alloc.alloc_table().ok_or(EptError::OutOfMemory)?;
     if !mem.write(pa, &[0u8; 4096]) {
         return Err(EptError::BadTable);
@@ -199,7 +255,58 @@ fn ept_map(
     perms: u64,
     size: u64,
 ) -> Result<(), EptError> {
-    todo!("walk from level 4 down to the target level (1 for 4K, 2 for 2M)")
+    // check alignment
+    if gpa % size != 0 || hpa % size != 0 {
+        return Err(EptError::Misaligned);
+    }
+    // walk the table levels 4..=1
+    let mut table = root;
+    let target_level = if size == PAGE_SIZE_4K { 1 } else { 2 };
+    for level in (1..=4).rev() {
+        // on each level, we read the entry based on the index from the gpa,
+        // validate it, after that:
+        // if we are at the target level, we write a leaf entry with the hpa and perms
+        // otherwise, we check if the entry is a large leaf, if so we return AlreadyMapped
+        // if not, we get the next table address, if it's 0 we allocate a new table and write the
+        // entry, otherwise we continue to the next level
+        let entry_idx = ept_index(gpa, level);
+        let entry = read_entry(mem, table, entry_idx).ok_or(EptError::BadTable)?;
+        if ept_misconfig_check(entry, level) {
+            return Err(EptError::BadTable);
+        }
+        if level == target_level {
+            // if the size is 2M, we need to check if the entry is a present non-leaf entry (a PT)
+            if size == PAGE_SIZE_2M && ept_present(entry) && entry & (1 << 7) == 0 {
+                return Err(EptError::AlreadyMapped);
+            }
+            // write the leaf entry
+            let leaf_entry = ept_entry(hpa, perms, VMX_EPT_MT_WB, size == PAGE_SIZE_2M);
+            if !write_entry(mem, table, entry_idx, leaf_entry) {
+                return Err(EptError::BadTable);
+            }
+            return Ok(());
+        } else {
+            // intermediate level: check if it's a large leaf
+            if entry & (1 << 7) != 0 {
+                return Err(EptError::AlreadyMapped);
+            }
+            // get the next table address
+            let next_table_pa = entry & EPT_ADDR_MASK;
+            if next_table_pa == 0 {
+                // allocate a new table
+                let new_table_pa = ept_new_table(mem, alloc)?;
+                let new_entry = ept_table_entry(new_table_pa);
+                if !write_entry(mem, table, entry_idx, new_entry) {
+                    return Err(EptError::BadTable);
+                }
+                table = new_table_pa;
+            } else {
+                table = next_table_pa;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Map one 4 KiB page. See [`ept_map`] (private; call it with `PAGE_SIZE_4K`).
@@ -211,7 +318,7 @@ pub fn ept_map_page(
     hpa: u64,
     perms: u64,
 ) -> Result<(), EptError> {
-    todo!("forward to ept_map")
+    ept_map(mem, alloc, root, gpa, hpa, perms, PAGE_SIZE_4K)
 }
 
 /// Map one 2 MiB page (a PD entry with bit 7 set). See [`ept_map`].
@@ -223,7 +330,7 @@ pub fn ept_map_2m(
     hpa: u64,
     perms: u64,
 ) -> Result<(), EptError> {
-    todo!("forward to ept_map")
+    ept_map(mem, alloc, root, gpa, hpa, perms, PAGE_SIZE_2M)
 }
 
 /// Software EPT walk: translate `gpa` for an access of kind `access` (a mask of
@@ -241,8 +348,46 @@ pub fn ept_map_2m(
 /// A table address outside the memory model is `Err(BadTable{level})`.
 /// (kernel: this is hardware; the closest software walkers are `kvm_tdp_mmu_get_walk` /
 /// `tdp_iter_*`, and `vmx_get_ept_mapping`-style debug helpers.)
-pub fn ept_translate(mem: &impl GuestMem, root: u64, gpa: u64, access: u64) -> Result<u64, EptFault> {
-    todo!("walk, accumulate permissions, stop at the leaf")
+pub fn ept_translate(
+    mem: &impl GuestMem,
+    root: u64,
+    gpa: u64,
+    access: u64,
+) -> Result<u64, EptFault> {
+    let mut table = root;
+    let mut effective_perms = EPT_PERM_RWX; // start with all permissions
+    for level in (1..=4).rev() {
+        let entry_idx = ept_index(gpa, level);
+        let entry = read_entry(mem, table, entry_idx).ok_or(EptFault::BadTable { level })?;
+        if ept_misconfig_check(entry, level) {
+            return Err(EptFault::Misconfig { level });
+        }
+        if !ept_present(entry) {
+            return Err(EptFault::Violation { level, perms: 0 });
+        }
+        effective_perms &= entry & EPT_PERM_RWX;
+        let is_leaf = level == 1 || (level == 2 || level == 3) && (entry & (1 << 7) != 0);
+        if is_leaf {
+            if effective_perms & access != access {
+                return Err(EptFault::Violation {
+                    level,
+                    perms: effective_perms as u8,
+                });
+            }
+            let page_size = if level == 3 {
+                PAGE_SIZE_1G
+            } else if level == 2 {
+                PAGE_SIZE_2M
+            } else {
+                PAGE_SIZE_4K
+            };
+            let offset = gpa & (page_size - 1);
+            return Ok((entry & EPT_ADDR_MASK) + offset);
+        } else {
+            table = entry & EPT_ADDR_MASK;
+        }
+    }
+    unreachable!()
 }
 
 // ---------------------------------------------------------------------------------
@@ -271,13 +416,22 @@ pub struct ept_violation {
 /// Decode Table 28-7. (kernel: `handle_ept_violation` builds `error_code` from the same
 /// bits: `EPT_VIOLATION_ACC_READ`, `_WRITE`, `_INSTR`, `_PROT_*`...)
 pub fn ept_violation_decode(q: u64) -> ept_violation {
-    todo!("one bool per bit")
+    ept_violation {
+        read: q & (1 << 0) != 0,
+        write: q & (1 << 1) != 0,
+        fetch: q & (1 << 2) != 0,
+        readable: q & (1 << 3) != 0,
+        writable: q & (1 << 4) != 0,
+        executable: q & (1 << 5) != 0,
+        gla_valid: q & (1 << 7) != 0,
+        translated: q & (1 << 8) != 0,
+    }
 }
 
 /// Is the violation a pure "not mapped" fault (the entry allowed nothing at all)? A VMM
 /// uses this to decide between "populate the page" and "report a protection error".
 pub fn ept_violation_is_unmapped(v: &ept_violation) -> bool {
-    todo!("none of the entry permission bits is set")
+    !v.readable && !v.writable && !v.executable
 }
 
 /// The 16-byte INVEPT descriptor (SDM 30.3, INVEPT): bytes 0..8 = EPT pointer, bytes
@@ -285,5 +439,7 @@ pub fn ept_violation_is_unmapped(v: &ept_violation) -> bool {
 /// hardware ignores). Little-endian. The instruction's *type* operand
 /// (`VMX_EPT_EXTENT_CONTEXT` / `GLOBAL`) goes in a register, not here.
 pub fn invept_descriptor(eptp: u64) -> [u8; 16] {
-    todo!("eptp then zeros")
+    let mut desc = [0u8; 16];
+    desc[0..8].copy_from_slice(&eptp.to_le_bytes());
+    desc
 }
