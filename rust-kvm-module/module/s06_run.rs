@@ -187,7 +187,7 @@ pub(crate) fn host_take_interrupt() {
 /// must outlive it. It derefs to `vcpu_vmx`, so `vmx.regs[..]` keeps working. (Kernel
 /// analogue: `struct vcpu_vmx` owning its `loaded_vmcs`; here the nesting is inverted.)
 pub(crate) struct ktvmx_vcpu {
-    vcpu: vcpu_vmx,
+    pub vcpu: vcpu_vmx,
     // Guest page tables: GUEST_CR3 points at `_pml4`, so they must live as long as the VMCS.
     _pml4: hw::PageBox,
     _pdpt: hw::PageBox,

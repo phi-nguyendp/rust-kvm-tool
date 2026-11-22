@@ -20,9 +20,10 @@ use kernel::prelude::*;
 use crate::{
     hw::{self, PageBox},
     s03_vmcs::HwVmcs,
-    s06_run::vcpu_vmx,
+    s06_run::{ktvmx_vcpu, vcpu_vmx},
     vmcs_ops::{GuestMem, VmcsOps},
     vmx::*,
+    vmx_enable::*,
     vmx_ept::*,
     vmx_exit::*,
 };
@@ -84,14 +85,14 @@ impl EptTableAlloc for table_pages {
 /// In VMX operation; the CPU must support INVEPT (IA32_VMX_EPT_VPID_CAP bit 20 for context,
 /// bit 21 for global).
 pub(crate) unsafe fn invept(ext: u64, eptp: u64) -> bool {
-    //todo!("descriptor + asm!(\"invept ...\") + check CF/ZF")
     let desc = invept_descriptor(eptp);
     let mut rflags: u64;
     asm!(
         "invept {ext}, [{desc}]",
+        "pushfq", "pop {f}",
         ext = in(reg) ext,
         desc = in(reg) &desc,
-        out("rflags") rflags,
+        f = out(reg)rflags,
     );
 
     if vmx_fail_kind(rflags) == VmxResult::Succeed {
@@ -120,18 +121,22 @@ pub(crate) fn ept_enable(
     if (cap & (1 << 6)) == 0 || (cap & (1 << 14)) == 0 {
         return Err("EPT not supported");
     }
-    let ctl2 = vmcs.vmcs_readl(SECONDARY_VM_EXEC_CONTROL);
-    if (ctl2 & SECONDARY_EXEC_ENABLE_EPT) == 0 || (ctl2 & SECONDARY_EXEC_UNRESTRICTED_GUEST) == 0 {
+    // What the CPU *allows*: the allowed-1 half (high dword) of the capability MSR
+    // (SDM App. A.3.3). The VMCS field below only says what is enabled right now.
+    let allowed1 = (hw::rdmsr(MSR_IA32_VMX_PROCBASED_CTLS2) >> 32) as u32;
+    let need = SECONDARY_EXEC_ENABLE_EPT | SECONDARY_EXEC_UNRESTRICTED_GUEST;
+    if allowed1 & need != need {
         return Err("EPT or unrestricted guest not allowed by the CPU");
     }
+    let ctl2 = vmcs.vmcs_readl(SECONDARY_VM_EXEC_CONTROL);
     let ctl1 = vmcs.vmcs_readl(CPU_BASED_VM_EXEC_CONTROL);
     vmcs.vmcs_writel(
         CPU_BASED_VM_EXEC_CONTROL,
-        ctl1 | CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
+        ctl1 | (CPU_BASED_ACTIVATE_SECONDARY_CONTROLS as u64),
     );
     vmcs.vmcs_writel(
         SECONDARY_VM_EXEC_CONTROL,
-        ctl2 | SECONDARY_EXEC_ENABLE_EPT | SECONDARY_EXEC_UNRESTRICTED_GUEST,
+        ctl2 | (SECONDARY_EXEC_ENABLE_EPT as u64) | (SECONDARY_EXEC_UNRESTRICTED_GUEST as u64),
     );
     vmcs.vmcs_writel(EPT_POINTER, construct_eptp(root_pa, false));
     Ok(())
@@ -166,7 +171,7 @@ pub(crate) fn ept_handle_violation(g: &mut ept_guest) -> core::result::Result<()
 
 /// A real-mode guest with its RAM behind EPT. PROVIDED.
 pub(crate) struct ept_guest {
-    pub vmx: vcpu_vmx,
+    pub vmx: ktvmx_vcpu,
     pub root: u64,
     pub ram: KVec<PageBox>,
     pub tables: table_pages,
