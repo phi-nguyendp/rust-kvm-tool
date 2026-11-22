@@ -38,12 +38,24 @@ pub(crate) struct host_phys {
 impl GuestMem for host_phys {
     fn read(&self, pa: u64, buf: &mut [u8]) -> bool {
         // SAFETY: the EPT code only follows addresses of tables we built from PageBoxes.
-        unsafe { core::ptr::copy_nonoverlapping(pa.wrapping_add(self.off) as *const u8, buf.as_mut_ptr(), buf.len()) };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                pa.wrapping_add(self.off) as *const u8,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
         true
     }
     fn write(&mut self, pa: u64, buf: &[u8]) -> bool {
         // SAFETY: as above.
-        unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), pa.wrapping_add(self.off) as *mut u8, buf.len()) };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                buf.as_ptr(),
+                pa.wrapping_add(self.off) as *mut u8,
+                buf.len(),
+            )
+        };
         true
     }
 }
@@ -72,8 +84,21 @@ impl EptTableAlloc for table_pages {
 /// In VMX operation; the CPU must support INVEPT (IA32_VMX_EPT_VPID_CAP bit 20 for context,
 /// bit 21 for global).
 pub(crate) unsafe fn invept(ext: u64, eptp: u64) -> bool {
-    let _ = (ext, eptp);
-    todo!("descriptor + asm!(\"invept ...\") + check CF/ZF")
+    //todo!("descriptor + asm!(\"invept ...\") + check CF/ZF")
+    let desc = invept_descriptor(eptp);
+    let mut rflags: u64;
+    asm!(
+        "invept {ext}, [{desc}]",
+        ext = in(reg) ext,
+        desc = in(reg) &desc,
+        out("rflags") rflags,
+    );
+
+    if vmx_fail_kind(rflags) == VmxResult::Succeed {
+        true
+    } else {
+        false
+    }
 }
 
 /// Turn EPT on in the *current* VMCS. Steps:
@@ -87,9 +112,29 @@ pub(crate) unsafe fn invept(ext: u64, eptp: u64) -> bool {
 /// (kernel: `vmx_exec_control`/`vmx_secondary_exec_control` pick bits from `vmcs_config`, and
 /// `vmx_load_mmu_pgd` writes `EPT_POINTER`. A cleaner version of this goes through stage 4's
 /// `adjust_vmx_controls`.)
-pub(crate) fn ept_enable(vmcs: &mut impl VmcsOps, root_pa: u64) -> core::result::Result<(), &'static str> {
-    let _ = (&vmcs, root_pa);
-    todo!("check capabilities, set secondary controls, write EPT_POINTER")
+pub(crate) fn ept_enable(
+    vmcs: &mut impl VmcsOps,
+    root_pa: u64,
+) -> core::result::Result<(), &'static str> {
+    let cap = hw::rdmsr(MSR_IA32_VMX_EPT_VPID_CAP);
+    if (cap & (1 << 6)) == 0 || (cap & (1 << 14)) == 0 {
+        return Err("EPT not supported");
+    }
+    let ctl2 = vmcs.vmcs_readl(SECONDARY_VM_EXEC_CONTROL);
+    if (ctl2 & SECONDARY_EXEC_ENABLE_EPT) == 0 || (ctl2 & SECONDARY_EXEC_UNRESTRICTED_GUEST) == 0 {
+        return Err("EPT or unrestricted guest not allowed by the CPU");
+    }
+    let ctl1 = vmcs.vmcs_readl(CPU_BASED_VM_EXEC_CONTROL);
+    vmcs.vmcs_writel(
+        CPU_BASED_VM_EXEC_CONTROL,
+        ctl1 | CPU_BASED_ACTIVATE_SECONDARY_CONTROLS,
+    );
+    vmcs.vmcs_writel(
+        SECONDARY_VM_EXEC_CONTROL,
+        ctl2 | SECONDARY_EXEC_ENABLE_EPT | SECONDARY_EXEC_UNRESTRICTED_GUEST,
+    );
+    vmcs.vmcs_writel(EPT_POINTER, construct_eptp(root_pa, false));
+    Ok(())
 }
 
 /// Handle `EXIT_REASON_EPT_VIOLATION` for a not-present page of guest RAM: read
@@ -99,8 +144,24 @@ pub(crate) fn ept_enable(vmcs: &mut impl VmcsOps, root_pa: u64) -> core::result:
 /// EPT_PERM_RWX)`. Anything else (a protection fault, a GPA outside RAM): `Err`. After changing
 /// an entry that was *not present* no INVEPT is needed; think about when it is (stage doc).
 pub(crate) fn ept_handle_violation(g: &mut ept_guest) -> core::result::Result<(), &'static str> {
-    let _ = g;
-    todo!("decode the exit, map the page")
+    let vmcs = HwVmcs;
+    let gpa = vmcs.vmcs_read64(GUEST_PHYSICAL_ADDRESS);
+    let q = ept_violation_decode(vmcs.vmcs_readl(EXIT_QUALIFICATION));
+    if !ept_violation_is_unmapped(&q) {
+        return Err("EPT violation is not a missing page");
+    }
+    if gpa >= (GUEST_RAM_PAGES as u64) << 12 {
+        return Err("EPT violation GPA outside guest RAM");
+    }
+    ept_map_page(
+        &mut g.mem,
+        &mut g.tables,
+        g.root,
+        gpa & !0xfff,
+        g.ram[(gpa >> 12) as usize].phys(),
+        EPT_PERM_RWX,
+    )
+    .map_err(|_| "ept_map_page failed")
 }
 
 /// A real-mode guest with its RAM behind EPT. PROVIDED.
@@ -119,12 +180,48 @@ pub(crate) fn vmx_set_real_mode(vmcs: &mut impl VmcsOps, rip: u64, rsp: u64) {
     const AR_CODE: u64 = 0x9b;
     const AR_DATA: u64 = 0x93;
     let segs: [(u32, u32, u32, u32, u64); 6] = [
-        (GUEST_ES_SELECTOR, GUEST_ES_BASE, GUEST_ES_LIMIT, GUEST_ES_AR_BYTES, AR_DATA),
-        (GUEST_CS_SELECTOR, GUEST_CS_BASE, GUEST_CS_LIMIT, GUEST_CS_AR_BYTES, AR_CODE),
-        (GUEST_SS_SELECTOR, GUEST_SS_BASE, GUEST_SS_LIMIT, GUEST_SS_AR_BYTES, AR_DATA),
-        (GUEST_DS_SELECTOR, GUEST_DS_BASE, GUEST_DS_LIMIT, GUEST_DS_AR_BYTES, AR_DATA),
-        (GUEST_FS_SELECTOR, GUEST_FS_BASE, GUEST_FS_LIMIT, GUEST_FS_AR_BYTES, AR_DATA),
-        (GUEST_GS_SELECTOR, GUEST_GS_BASE, GUEST_GS_LIMIT, GUEST_GS_AR_BYTES, AR_DATA),
+        (
+            GUEST_ES_SELECTOR,
+            GUEST_ES_BASE,
+            GUEST_ES_LIMIT,
+            GUEST_ES_AR_BYTES,
+            AR_DATA,
+        ),
+        (
+            GUEST_CS_SELECTOR,
+            GUEST_CS_BASE,
+            GUEST_CS_LIMIT,
+            GUEST_CS_AR_BYTES,
+            AR_CODE,
+        ),
+        (
+            GUEST_SS_SELECTOR,
+            GUEST_SS_BASE,
+            GUEST_SS_LIMIT,
+            GUEST_SS_AR_BYTES,
+            AR_DATA,
+        ),
+        (
+            GUEST_DS_SELECTOR,
+            GUEST_DS_BASE,
+            GUEST_DS_LIMIT,
+            GUEST_DS_AR_BYTES,
+            AR_DATA,
+        ),
+        (
+            GUEST_FS_SELECTOR,
+            GUEST_FS_BASE,
+            GUEST_FS_LIMIT,
+            GUEST_FS_AR_BYTES,
+            AR_DATA,
+        ),
+        (
+            GUEST_GS_SELECTOR,
+            GUEST_GS_BASE,
+            GUEST_GS_LIMIT,
+            GUEST_GS_AR_BYTES,
+            AR_DATA,
+        ),
     ];
     for (sel, base, limit, ar, arv) in segs {
         vmcs.vmcs_writel(sel, 0);
@@ -160,17 +257,24 @@ impl ept_guest {
     /// PROVIDED. 1 MiB of RAM at GPA 0; `code` = (gpa, bytes) pieces copied into it (each inside one
     /// page); every page is mapped read/write/execute **except** those in `holes`. The vCPU starts in
     /// real mode at 0000:1000 with SP = 0x8000.
-    pub(crate) fn new(code: &[(u64, &[u8])], holes: &[u64]) -> core::result::Result<Self, &'static str> {
+    pub(crate) fn new(
+        code: &[(u64, &[u8])],
+        holes: &[u64],
+    ) -> core::result::Result<Self, &'static str> {
         let mut ram = KVec::with_capacity(GUEST_RAM_PAGES, GFP_KERNEL).map_err(|_| "alloc ram")?;
         for _ in 0..GUEST_RAM_PAGES {
-            ram.push(PageBox::new().map_err(|_| "alloc ram page")?, GFP_KERNEL).map_err(|_| "alloc ram")?;
+            ram.push(PageBox::new().map_err(|_| "alloc ram page")?, GFP_KERNEL)
+                .map_err(|_| "alloc ram")?;
         }
         for (gpa, bytes) in code {
             let off = (*gpa & 0xfff) as usize;
-            ram[(*gpa >> 12) as usize].as_mut_slice()[off..off + bytes.len()].copy_from_slice(bytes);
+            ram[(*gpa >> 12) as usize].as_mut_slice()[off..off + bytes.len()]
+                .copy_from_slice(bytes);
         }
         let probe = PageBox::new().map_err(|_| "alloc probe")?;
-        let mut mem = host_phys { off: (probe.as_ptr() as u64).wrapping_sub(probe.phys()) };
+        let mut mem = host_phys {
+            off: (probe.as_ptr() as u64).wrapping_sub(probe.phys()),
+        };
         let mut tables = table_pages { pages: KVec::new() };
         let root = ept_new_table(&mut mem, &mut tables).map_err(|_| "alloc ept root")?;
         for i in 0..GUEST_RAM_PAGES {
@@ -178,13 +282,27 @@ impl ept_guest {
             if holes.contains(&gpa) {
                 continue;
             }
-            ept_map_page(&mut mem, &mut tables, root, gpa, ram[i].phys(), EPT_PERM_RWX).map_err(|_| "ept_map_page")?;
+            ept_map_page(
+                &mut mem,
+                &mut tables,
+                root,
+                gpa,
+                ram[i].phys(),
+                EPT_PERM_RWX,
+            )
+            .map_err(|_| "ept_map_page")?;
         }
         let mut vmx = vcpu_vmx::new_flat32(0x1000, 0x8000)?;
         let mut vmcs = HwVmcs;
         ept_enable(&mut vmcs, root)?;
         vmx_set_real_mode(&mut vmcs, 0x1000, 0x8000);
-        Ok(Self { vmx, root, ram, tables, mem })
+        Ok(Self {
+            vmx,
+            root,
+            ram,
+            tables,
+            mem,
+        })
     }
 
     /// PROVIDED. Enter the guest; host interrupts that hit meanwhile (external-interrupt exits) are
@@ -210,7 +328,10 @@ pub(crate) fn selftest() -> core::result::Result<(), &'static str> {
     // First entry: the store to the unmapped page violates.
     let raw = g.run();
     if raw & 0xffff != EXIT_REASON_EPT_VIOLATION {
-        pr_err!("ktvmx: expected EPT violation, got exit reason {:#x}\n", raw);
+        pr_err!(
+            "ktvmx: expected EPT violation, got exit reason {:#x}\n",
+            raw
+        );
         return Err("first exit is not an EPT violation");
     }
     let vmcs = HwVmcs;
